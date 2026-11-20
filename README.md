@@ -13,6 +13,6 @@ For the 14-day input window, each event takes expected constant work. A seven-da
 
 ## Verification
 
-`scripts/bench.sh 20000000 19 3` builds the image, runs the organizers' 36 fixtures and exact million-event comparison, then times three fresh containers on a generated practice-size input. Pass `60000000` for final size. The script uses the organizers' public Rust generator and checker, and requires Linux, Docker, Cargo, Python with Polars, curl and unzip. Set `NCPU=8 MEM_GB=24` on a suitable host to reproduce the resource limits. The manually triggered GitHub workflow runs the same script on a standard Linux runner.
+`scripts/bench.sh 20000000 19 3` builds the image, runs the organizers' 36 fixtures and exact million-event comparison, then times three fresh containers on a generated practice-size input. Pass `60000000` for final size. The script uses the organizers' public Rust generator and checker, and requires Linux, Docker, Cargo, Python with Polars, curl and unzip. Set `NCPU=8 MEM_GB=24` on a suitable host to reproduce the resource limits. Benchmarks run locally.
 
 For a native build, run `make ARROW_PREFIX=/path/to/arrow`. Run `./pipeline INPUT EMPTY_OUTPUT` with `NCPU` set to the desired thread count. Set `PROFILE=1` for stage timings on stderr.
