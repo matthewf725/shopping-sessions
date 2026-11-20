@@ -7,11 +7,11 @@ WORKDIR /build
 COPY Makefile .
 COPY src/ src/
 RUN mkdir /artifacts && \
-    case "$(uname -m)" in x86_64) arch=-march=x86-64-v3 ;; *) arch='' ;; esac && \
+    case "$(uname -m)" in x86_64) arch=-march=x86-64-v2 ;; *) arch='' ;; esac && \
     make ARCH="$arch" ARROW_PREFIX=/opt/arrow ARROW_LINK='-l:libparquet.so.2100 -l:libarrow.so.2100' && \
     mv pipeline /artifacts/ && \
     if [ "$(uname -m)" = x86_64 ]; then \
-        make ARCH=-march=skylake-avx512 ARROW_PREFIX=/opt/arrow ARROW_LINK='-l:libparquet.so.2100 -l:libarrow.so.2100' && \
+        make ARCH='-march=skylake-avx512 -mtune=cascadelake' ARROW_PREFIX=/opt/arrow ARROW_LINK='-l:libparquet.so.2100 -l:libarrow.so.2100' && \
         mv pipeline /artifacts/pipeline-avx512; \
     fi
 

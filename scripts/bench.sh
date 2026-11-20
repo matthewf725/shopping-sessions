@@ -19,8 +19,8 @@ image=shopping-sessions-bench:local
 docker build --platform linux/amd64 -t "$image" "$root"
 run() {
     local data=$1 out=$2
-    mkdir -p "$out" "$work/scratch"
-    chmod a+rwx "$out" "$work/scratch"
+    mkdir -p "$out/user_daily" "$out/campaign_daily" "$work/scratch"
+    chmod a+rwx "$out" "$out/user_daily" "$out/campaign_daily" "$work/scratch"
     docker run --rm --platform linux/amd64 --read-only --network none --cap-drop ALL \
         --security-opt no-new-privileges --tmpfs /tmp:rw,size=64m,mode=1777 \
         --user 1000:1000 --cpus "$cpus" --memory "${MEM_GB:-7}g" --memory-swap "${MEM_GB:-7}g" \

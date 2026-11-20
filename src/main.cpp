@@ -113,20 +113,38 @@ struct Pipeline {
     void dedup(size_t p, Worker& dst) {
         size_t size = 0;
         for (auto& w : workers) size += w.parsed[p].size();
-        FlatMap<RawEvent*> best(size);
-        for (auto& w : workers) for (auto& row : w.parsed[p]) {
-            auto [prev, fresh] = best.add(row.id, &row);
-            if (fresh) continue;
-            if (row.ingest < prev->ingest) { prev->person = 0; prev = &row; }
-            else row.person = 0;
+        if (!size) return;
+        // A hash collision only selects a key for an exact comparison. A lone bit
+        // can bypass the full table. Both passes read the same contiguous shard.
+        struct Word { uint64_t seen = 0, repeated = 0; };
+        size_t words = std::bit_ceil(std::max<size_t>(1, (size + 3) / 4));
+        std::vector<Word> filter(words);
+        const size_t mask = words * 64 - 1;
+        for (auto& w : workers) for (const auto& row : w.parsed[p]) {
+            size_t h = hash_key(row.id) & mask;
+            uint64_t bit = uint64_t(1) << (h & 63);
+            auto& word = filter[h >> 6];
+            word.repeated |= word.seen & bit;
+            word.seen |= bit;
         }
-        for (auto& w : workers) {
-            for (auto& row : w.parsed[p]) if (row.person) {
+        FlatMap<RawEvent*> best(size / 10);
+        auto emit = [&](const RawEvent& row) {
+            if (row.person) {
                 Key person = people.resolve(row.person);
                 dst.events[partition(person)].push_back({person, row.event});
             }
-            std::vector<RawEvent>().swap(w.parsed[p]);
+        };
+        for (auto& w : workers) for (auto& row : w.parsed[p]) {
+            size_t h = hash_key(row.id) & mask;
+            if (!(filter[h >> 6].repeated & (uint64_t(1) << (h & 63)))) {
+                emit(row);
+                continue;
+            }
+            auto [prev, fresh] = best.add(row.id, &row);
+            if (!fresh && row.ingest < prev->ingest) prev = &row;
         }
+        for (const auto& slot : best.slots()) if (slot.key) emit(*slot.value);
+        for (auto& w : workers) std::vector<RawEvent>().swap(w.parsed[p]);
     }
     void distribute() {
         size_t n = workers.size();

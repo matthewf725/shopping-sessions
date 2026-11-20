@@ -208,6 +208,26 @@ inline int64_t decimal(Text s, int64_t limit) {
     return n;
 }
 
+// Parse the common 13-digit epoch form without a serial multiply-by-ten chain.
+inline Time epoch13(const char* p) {
+    uint64_t head, tail;
+    memcpy(&head, p, 8);
+    memcpy(&tail, p + 5, 8);
+    if constexpr (std::endian::native == std::endian::big) {
+        head = __builtin_bswap64(head);
+        tail = __builtin_bswap64(tail);
+    }
+    constexpr uint64_t zero = 0x3030303030303030ULL;
+    constexpr uint64_t upper = 0x4646464646464646ULL;
+    constexpr uint64_t high = 0x8080808080808080ULL;
+    if (((head - zero) | (head + upper) | (tail - zero) | (tail + upper)) & high) return invalid_time;
+    head -= zero;
+    head = (head * 10 + (head >> 8)) & 0x00ff00ff00ff00ffULL;
+    head = (head * 100 + (head >> 16)) & 0x0000ffff0000ffffULL;
+    uint32_t first_eight = uint32_t(head) * 10000 + uint32_t(head >> 32);
+    return Time(first_eight) * 100000 + (p[8] - '0') * 10000 + pair_value(p+9) * 100 + pair_value(p+11);
+}
+
 class Clock {
     struct Month { uint64_t prefix = 0; int first = 0, days = 0; };
     std::array<Month, 16> months_{};
@@ -264,6 +284,7 @@ public:
         return (Time(m.first) + d - 1) * day_ms + ((h * 60 + min - offset) * 60 + sec) * 1000LL;
     }
     Time parse(Text s) const {
+        if (s.size() == 13) return epoch13(s.data());
         if ((s.size() == 20 || s.size() == 25) && s[4] == '-') return iso(s);
         const int64_t n = decimal(s, std::numeric_limits<int64_t>::max());
         return n < 0 ? invalid_time : n;
