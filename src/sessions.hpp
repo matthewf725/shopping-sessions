@@ -6,10 +6,18 @@ namespace shop {
 constexpr Time gap = 30 * 60 * 1000;
 struct Event { Time ts; uint32_t price, category; };
 struct Click { Time ts; Key id; uint32_t campaign; };
+struct RelativeEvent { uint32_t when, purchase; };
+struct RelativeClick { Key id; uint32_t when, campaign; };
+static_assert(sizeof(RelativeEvent) == 8 && sizeof(RelativeClick) == 16);
+// Valid prices are at most 10,000,000. The category numbers start at one.
+inline bool relative_ranges(const Window& w, const Dimensions& d) {
+    return uint64_t(w.end - w.start - 1) <= UINT32_MAX - uint64_t(week_ms)
+        && d.categories.size() <= UINT8_MAX;
+}
 // A range of observations for one raw user. Linked aliases share a chain.
 struct Segment {
-    const Event* events;
-    const Click* clicks;
+    const void* events;
+    const void* clicks;
     uint32_t n, m;
     Key name;
     Segment* next = nullptr;
@@ -123,6 +131,7 @@ class Shopper {
     struct AssistRange { size_t first_session = SIZE_MAX; Time latest_click = invalid_time; };
     static constexpr uint32_t none = UINT32_MAX;
     Time origin_;
+    bool relative_;
     bool vector_window_ = false;
     const Keys& click_keys_;
     // These workspaces are reused across people. Clear only touched cells, categories and campaigns.
@@ -159,7 +168,11 @@ class Shopper {
         b.last = std::max(b.last, ts);
         return b;
     }
-    void collect(const Event* events, size_t count) {
+    Event expand(RelativeEvent e) const { return {origin_ + e.when, e.purchase & 0xffffffu, e.purchase >> 24}; }
+    Click expand(RelativeClick c) const { return {origin_ - week_ms + c.when, c.id, c.campaign}; }
+    static Event expand(Event e) { return e; }
+    static Click expand(Click c) { return c; }
+    template<class Row> void collect(const Row* events, size_t count) {
 #if defined(__AVX512CD__)
         size_t i = 0;
         if (!bins_.empty() && vector_window_) {
@@ -169,12 +182,17 @@ class Shopper {
             constexpr uint64_t magic = ((uint64_t(1) << 41) + 28124) / 28125;
             for (; i + 8 <= count; i += 8) {
                 auto first = _mm512_loadu_si512(events + i);
-                auto second = _mm512_loadu_si512(events + i + 4);
-                auto times =
-                    _mm512_permutex2var_epi64(first, _mm512_setr_epi64(0, 2, 4, 6, 8, 10, 12, 14), second);
-                auto prices =
-                    _mm512_permutex2var_epi64(first, _mm512_setr_epi64(1, 3, 5, 7, 9, 11, 13, 15), second);
-                auto delta = _mm512_sub_epi64(times, _mm512_set1_epi64(origin_));
+                __m512i times, prices, delta;
+                if constexpr (std::is_same_v<Row, RelativeEvent>) {
+                    delta = first & _mm512_set1_epi64(UINT32_MAX);
+                    times = _mm512_add_epi64(delta, _mm512_set1_epi64(origin_));
+                    prices = _mm512_srli_epi64(first, 32) & _mm512_set1_epi64(0xffffff);
+                } else {
+                    auto second = _mm512_loadu_si512(events + i + 4);
+                    times = _mm512_permutex2var_epi64(first, _mm512_setr_epi64(0, 2, 4, 6, 8, 10, 12, 14), second);
+                    prices = _mm512_permutex2var_epi64(first, _mm512_setr_epi64(1, 3, 5, 7, 9, 11, 13, 15), second);
+                    delta = _mm512_sub_epi64(times, _mm512_set1_epi64(origin_));
+                }
                 auto cell = _mm512_srli_epi64(
                     _mm512_mul_epu32(_mm512_srli_epi64(delta, 6), _mm512_set1_epi64(magic)), 41);
                 auto index = _mm512_add_epi64(cell, _mm512_slli_epi64(cell, 1));
@@ -197,7 +215,7 @@ class Shopper {
                     first_word_ = std::min(size_t(word), first_word_);
                     last_word_ = std::max(size_t(word), last_word_);
                     if (!(fast & (1u << j))) {
-                        const auto &e = events[i + j];
+                        const Event e = expand(events[i + j]);
                         auto &b = bins_[k];
                         ++b.events;
                         b.first = std::min(b.first, e.ts);
@@ -214,7 +232,7 @@ class Shopper {
         size_t i = 0;
 #endif
         for (; i < count; ++i) {
-            const Event& e = events[i];
+            const Event e = expand(events[i]);
             uint32_t pos = cell(e.ts);
             Bucket* b;
             if (!bins_.empty()) {
@@ -305,9 +323,9 @@ class Shopper {
         if ((word & bit) && (inclusive ? sessions_[n].start <= t : sessions_[n].start < t)) ++n;
         return n;
     }
-    void attribute(const Segment* chain, CampaignDays& campaigns) {
+    template<class Row> void attribute(const Segment* chain, CampaignDays& campaigns) {
         for (auto seg = chain; seg; seg = seg->next) for (uint32_t i = 0; i < seg->m; ++i) {
-            const Click& c = seg->clicks[i];
+            const Click c = expand(static_cast<const Row*>(seg->clicks)[i]);
             size_t first = rank(c.ts, false);
             if (first == sessions_.size() || sessions_[first].start - c.ts > week_ms) continue;
             auto& best = sessions_[first].credit;
@@ -351,7 +369,7 @@ class Shopper {
     }
 public:
     Shopper(const Window& w, const Dimensions& d, const Keys& click_keys)
-        : origin_(w.start), click_keys_(click_keys), category_sums_(d.categories.size()+1), campaign_count_(d.names.size()) {
+        : origin_(w.start), relative_(relative_ranges(w, d)), click_keys_(click_keys), category_sums_(d.categories.size()+1), campaign_count_(d.names.size()) {
         vector_window_ = uint64_t(w.end - w.start - 1) <= UINT32_MAX;
         size_t weeks = size_t((w.end - w.start - 1) / week_ms) + 2;
         if (weeks <= 1'000'000 / campaign_count_) coverage_.resize(weeks * campaign_count_);
@@ -363,18 +381,23 @@ public:
             start_rank_.resize(occupied_.size());
         }
     }
-    template<class Rows> void run(Key person, const Segment* chain, Rows& users, CampaignDays& campaigns) {
+    template<class EventRow, class ClickRow, class Rows>
+    void run_ranges(Key person, const Segment* chain, Rows& users, CampaignDays& campaigns) {
         sessions_.clear();
         first_word_ = occupied_.size();
         last_word_ = 0;
         bool has_events = false;
         for (auto seg = chain; seg; seg = seg->next) if (seg->n) {
-            collect(seg->events, seg->n);
+            collect(static_cast<const EventRow*>(seg->events), seg->n);
             has_events = true;
         }
         if (!has_events) return;
         form_sessions(person, users);
-        attribute(chain, campaigns);
+        attribute<ClickRow>(chain, campaigns);
+    }
+    template<class Rows> void run(Key person, const Segment* chain, Rows& users, CampaignDays& campaigns) {
+        if (relative_) run_ranges<RelativeEvent, RelativeClick>(person, chain, users, campaigns);
+        else run_ranges<Event, Click>(person, chain, users, campaigns);
     }
 };
 } // namespace shop

@@ -8,10 +8,10 @@
 
 namespace shop {
 
-// Time disjoint input chunks. Every sample computes its actual output exactly once.
-class ParserChoice {
-    static constexpr unsigned modes = 3;
-    static constexpr unsigned per_mode = 12;
+// Each sample executes its real chunk or shard once. The final selection uses
+// thread CPU time per input byte to account for differences in work size.
+template<unsigned modes, unsigned per_mode>
+class TimedChoice {
     static constexpr unsigned sample_count = modes * per_mode;
     std::atomic<unsigned> issued_{0}, completed_{0}, best_{modes};
     std::array<uint64_t, sample_count> rates_{};
@@ -64,4 +64,6 @@ public:
             choose();
     }
 };
+using ParserChoice = TimedChoice<4, 12>;
+using ShardChoice = TimedChoice<2, 8>;
 } // namespace shop

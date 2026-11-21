@@ -25,6 +25,63 @@ struct EventLanes {
     static V lookup(const void* base, I indices) {
         return _mm512_i32gather_epi64(indices, base, 8);
     }
+    template<unsigned Stride, unsigned Column>
+    static V column_lanes() {
+        alignas(64) static constexpr auto indices = [] {
+            std::array<uint32_t, 16> index{};
+            for (unsigned lane = 0; lane < 16; ++lane) {
+                unsigned row = lane & 7;
+                unsigned column = Column + (lane >> 3);
+                if constexpr (Stride == 7) {
+                    unsigned n = (row & 3) * 7 + column;
+                    index[lane] = n < 16 ? n : n + 4; // Second load starts at 12.
+                } else {
+                    index[lane] = row * 4 + column;
+                }
+            }
+            return index;
+        }();
+        return _mm512_load_si512(indices.data());
+    }
+    static void split_columns(V pair, I& left, I& right) {
+        left = _mm512_castsi512_si256(pair);
+        right = _mm512_extracti64x4_epi64(pair, 1);
+    }
+    template<unsigned Stride, size_t Count>
+    static void field_offsets(const uint32_t* cuts, const uint16_t* rows, bool packed, I (&columns)[Count]) {
+        static_assert((Stride == 7 && Count == 6) || (Stride == 4 && Count == 5));
+        // An accepted row consumes exactly Stride separators. Any rejected physical
+        // line between accepted rows consumes at least one more. Equal endpoint
+        // distance proves all eight rows are consecutive in the separator table.
+        if (packed && unsigned(rows[7] - rows[0]) == 7 * Stride) {
+            const uint32_t* first = cuts + rows[0];
+            V a = _mm512_loadu_si512(first);
+            if constexpr (Stride == 7) {
+                V b = _mm512_loadu_si512(first + 12), c = _mm512_loadu_si512(first + 28),
+                  d = _mm512_loadu_si512(first + 40);
+                auto pair = [&]<unsigned Column>() {
+                    V index = column_lanes<7, Column>();
+                    V lower = _mm512_permutex2var_epi32(a, index, b);
+                    V upper = _mm512_permutex2var_epi32(c, index, d);
+                    split_columns(_mm512_mask_blend_epi32(0xf0f0, lower, upper),
+                                  columns[Column], columns[Column + 1]);
+                };
+                pair.template operator()<0>();
+                pair.template operator()<2>();
+                pair.template operator()<4>();
+            } else {
+                V b = _mm512_loadu_si512(first + 16);
+                split_columns(_mm512_permutex2var_epi32(a, column_lanes<4, 0>(), b), columns[0], columns[1]);
+                split_columns(_mm512_permutex2var_epi32(a, column_lanes<4, 2>(), b), columns[2], columns[3]);
+                I next = _mm256_permutevar8x32_epi32(columns[0], _mm256_setr_epi32(1,2,3,4,5,6,7,0));
+                columns[4] = _mm256_mask_set1_epi32(next, 0x80, first[32]);
+            }
+            return;
+        }
+        I index = _mm256_cvtepu16_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(rows)));
+        for (unsigned col = 0; col < Count; ++col)
+            columns[col] = _mm256_i32gather_epi32(reinterpret_cast<const int*>(cuts + col), index, 4);
+    }
     struct Field {
         I start, size;
         V head;
@@ -82,11 +139,9 @@ struct EventLanes {
     }
     template <class Store>
     static M run(const Window &window, const char *data, const uint32_t *cuts, const uint16_t *rows,
-                 Store store, unsigned active = 255) {
-        I indices = _mm256_cvtepu16_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(rows)));
+                 Store store, unsigned active = 255, bool packed = false) {
         I boundaries[6];
-        for (unsigned i = 0; i < 6; ++i)
-            boundaries[i] = _mm256_i32gather_epi32(reinterpret_cast<const int*>(cuts + i), indices, 4);
+        field_offsets<7>(cuts, rows, packed, boundaries);
         Field id = field(data, boundaries[0], boundaries[1]),
               user = field(data, boundaries[1], boundaries[2]);
         Field time = field(data, boundaries[2], boundaries[3]),
@@ -147,11 +202,9 @@ struct EventLanes {
 struct ClickLanes : EventLanes {
     template <class Store>
     static M parse(const Window &window, const Catalog &catalog, const char *data, const uint32_t *cuts,
-                   const uint16_t *rows, Store store, unsigned active = 255) {
-        I index = _mm256_cvtepu16_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(rows)));
+                   const uint16_t *rows, Store store, unsigned active = 255, bool packed = false) {
         I c[5];
-        for (unsigned i = 0; i < 5; ++i)
-            c[i] = _mm256_i32gather_epi32(reinterpret_cast<const int*>(cuts + i), index, 4);
+        field_offsets<4>(cuts, rows, packed, c);
         Field id = field(data, c[0], c[1]), user = field(data, c[1], c[2]),
               campaign = field(data, c[2], c[3]), time = field(data, c[3], c[4]);
         I ndigits = _mm256_sub_epi32(campaign.size, integer(2));
