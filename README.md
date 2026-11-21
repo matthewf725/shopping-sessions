@@ -22,7 +22,7 @@ For a native build, run `make ARROW_PREFIX=/path/to/arrow`. Run `./pipeline INPU
 
 ## Measurements
 
-The official Xeon practice score for commit `ef41f89` was **1.52 s** for team Uhhh. [Builders leaderboard](https://www.joinbuilders.org/buildathon/leaderboard)
+Team Uhhh scored **1.12 s** on the official Xeon practice run for commit `1018e64` (receipt `BB-74417B0D`). Its previous submission, `ef41f89`, scored 1.52 s. [Builders leaderboard](https://www.joinbuilders.org/buildathon/leaderboard)
 
 On an M4 Max with eight native worker threads and RAM-backed input and output, the raw-user grouping reduced median end-to-end time from 0.494 s to 0.454 s over five interleaved warm runs per variant on seed 19 (20M events, 5M clicks). The deduplication and repartitioning stage fell from 107 ms to 31 ms. The additional work to join alias ranges raised the following stage from 78 ms to 95 ms. Both variants produced identical rows.
 
