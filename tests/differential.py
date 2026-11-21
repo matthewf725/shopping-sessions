@@ -163,6 +163,17 @@ def adversarial(data, years):
         ('ebad', 'u1', str(base), iso(base), 'purchase', 'p2', '500'),
         ('elate', 'other', str(base), '2140-01-02T00:00:00Z', 'view', 'p1', ''),
     ])
+    # Keep distinct seven- and eight-byte suffixes, including at the 24 h + 1 ms cutoff.
+    events.extend([
+        ('e1234567', 'u1234567', str(base + DAY), iso(base + 2*DAY), 'purchase', 'p1', '101'),
+        ('e12345670', 'u12345670', str(base + DAY - 1), iso(base + 2*DAY), 'purchase', 'p2', '102'),
+        ('e12345671', 'u12345670', str(base + DAY), iso(base + DAY), 'view', 'p1', ''),
+    ])
+    # Ingest ordering across a clock-digit carry and across months with the same day number.
+    for eid, earlier, later in [('ecarry', '2024-01-01T09:59:59Z', '2024-01-01T10:00:00Z'),
+                                ('emonth', '2023-12-01T23:59:59Z', '2024-01-01T00:00:00Z')]:
+        events.append((eid, 'u1234567', str(base), earlier, 'purchase', 'p1', '103'))
+        events.append((eid, 'u12345670', str(base), later, 'view', 'p2', ''))
     data_sets = {'events': ('event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents', events),
                  'clicks': ('click_id,user_id,campaign_id,ts', clicks), 'links': ('user_id_a,user_id_b', links)}
     for name, (header, rows) in data_sets.items():

@@ -10,9 +10,8 @@ inline size_t partition(Key key) { return hash_key(key) >> 56; }
 // Views and carts need only two words beyond their IDs. Purchases and unusual
 // date ranges point into their parser worker's exact, immutable detail array.
 constexpr uint32_t detailed = 0x80000000u;
-constexpr int64_t seconds_bias = int64_t(1) << 30;
 struct PackedEvent { uint32_t when, tag; };
-struct Detail { Time ingest; Event event; };
+struct Detail { int64_t ingest_order; Event event; };
 struct RawEvent { Key id, person; PackedEvent event; };
 static_assert(sizeof(RawEvent) == 24);
 template<class T> struct Owned { Key person; T value; };
@@ -81,10 +80,11 @@ struct Pipeline {
             if (!id) return;
             // Ingest is guaranteed F1. Retain a tombstone for any invalid earliest copy.
             if (f[3].size() != 20) return;
-            Time ingest = window.clock.iso<true>(f[3]);
+            auto arrival = window.arrival(f[3]);
             Time ts = window.clock.parse(f[2]);
             uint32_t price = 0, category = 0;
-            bool valid = !f[1].empty() && !f[5].empty() && ts >= window.start && ts < window.end && ingest - ts <= day_ms;
+            bool valid = !f[1].empty() && !f[5].empty() && ts >= window.start && ts < window.end &&
+                         arrival.on_time(ts, f[3]);
             if (valid && f[4] == "purchase") {
                 int64_t p = decimal(f[6], 10'000'000);
                 valid = p > 0;
@@ -95,13 +95,12 @@ struct Pipeline {
                 }
             } else if (valid) valid = f[4] == "view" || f[4] == "cart";
             uint64_t when = valid ? uint64_t(ts - window.start) : 0;
-            int64_t seconds = (ingest - window.start) / 1000 + seconds_bias;
             PackedEvent event;
-            if (!price && when <= UINT32_MAX && uint64_t(seconds) < detailed) {
-                event = {uint32_t(when), uint32_t(seconds)};
+            if (!price && when <= UINT32_MAX && uint64_t(arrival.order) < detailed) {
+                event = {uint32_t(when), uint32_t(arrival.order)};
             } else {
                 event = {uint32_t(w.details.size()), detailed | w.number};
-                w.details.push_back({ingest, {ts, price, category}});
+                w.details.push_back({arrival.order, {ts, price, category}});
             }
             w.parsed[partition(id)].push_back({id, valid ? users.encode(f[1]) : 0, event});
         });
@@ -131,9 +130,9 @@ struct Pipeline {
             else parse_clicks(ck.chunks[job - click_start], workers[wi]);
         });
     }
-    Time ingestion(PackedEvent e) const {
-        if (e.tag & detailed) return workers[e.tag ^ detailed].details[e.when].ingest;
-        return window.start + (int64_t(e.tag) - seconds_bias) * 1000;
+    int64_t ingest_order(PackedEvent e) const {
+        if (e.tag & detailed) return workers[e.tag ^ detailed].details[e.when].ingest_order;
+        return e.tag;
     }
     Event unpack(PackedEvent e) const {
         if (e.tag & detailed) return workers[e.tag ^ detailed].details[e.when].event;
@@ -169,7 +168,7 @@ struct Pipeline {
                 continue;
             }
             auto [prev, fresh] = best.add(row.id, &row);
-            if (!fresh && ingestion(row.event) < ingestion(prev->event)) prev = &row;
+            if (!fresh && ingest_order(row.event) < ingest_order(prev->event)) prev = &row;
         }
         for (const auto& slot : best.slots()) if (slot.key) emit(*slot.value);
         for (auto& w : workers) std::vector<RawEvent>().swap(w.parsed[p]);

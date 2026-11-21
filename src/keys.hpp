@@ -37,12 +37,18 @@ public:
         if (s.front() == prefix_ && s.size() >= 2 && s.size() <= 9) {
             size_t n = s.size() - 1;
             uint64_t word = ~uint64_t(0) / 255;  // Pad with 0x01 for the byte-validity test.
-            if (n == 8) memcpy(&word, s.data() + 1, 8);
-            else memcpy(&word, s.data() + 1, n);
+            unsigned shift = 8 * (8 - n);
+            if (n >= 7) {
+                // For a seven-byte suffix the load also includes the known prefix.
+                memcpy(&word, s.data() + s.size() - 8, 8);
+            } else {
+                memcpy(&word, s.data() + 1, n);
+            }
             constexpr uint64_t high = 0x8080808080808080ULL, ones = 0x0101010101010101ULL;
             if (!(word & high) && !((word - ones) & ~word & high)) {
                 if constexpr (std::endian::native == std::endian::little) word = __builtin_bswap64(word);
-                return word & (~uint64_t(0) << (8 * (8 - n)));
+                if (n >= 7) return word << shift;
+                return word & (~uint64_t(0) << shift);
             }
         }
         return intern(s);

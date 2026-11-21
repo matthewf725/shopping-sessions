@@ -5,6 +5,7 @@
 #include <bit>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -373,9 +374,59 @@ public:
     }
 };
 
+inline int32_t utc_day(Time t) { return int32_t(t / day_ms - (t % day_ms < 0)); }
+
 struct Window {
     Clock clock;
     Time start, end;
+    struct Arrival {
+        int64_t order;
+        Time midnight;
+        bool on_time(Time ts, Text ingest) const {
+            // Only a next-day arrival can straddle the exact 24-hour cutoff.
+            if (ts >= midnight) return true;
+            if (midnight - ts > day_ms) return false;
+            const char* p = ingest.data();
+            int seconds = (pair_value(p+11) * 60 + pair_value(p+14)) * 60 + pair_value(p+17);
+            return midnight + seconds * 1000LL - ts <= day_ms;
+        }
+    };
+private:
+    struct IngestDay { uint64_t month_prefix; Time midnight; int64_t order_base; };
+    std::array<IngestDay, 64> ingest_days_{};
+    int32_t first_day_;
+
+    // Ingest is valid UTC F1. The packed decimal HHMMSS is ordered and fits in
+    // 22 bits. Bias the day so dates near the window fit in the record's 31 bits.
+    int64_t order_base(int32_t day) const {
+        return (int64_t(day) - first_day_ + 256) * (1 << 22);
+    }
+    static unsigned day_slot(const char* date) {
+        return ((date[8] & 3) << 4) | (date[9] & 15);
+    }
+    static uint32_t clock_digits(const char* date) {
+        uint64_t word;
+        memcpy(&word, date + 11, 8);  // HH:MM:SS
+        if constexpr (std::endian::native == std::endian::little) word = __builtin_bswap64(word);
+        constexpr uint64_t digit_mask = 0x0f0f000f0f000f0fULL;
+#if defined(__BMI2__) && defined(__x86_64__)
+        return uint32_t(_pext_u64(word, digit_mask));
+#else
+        uint64_t digits = word & digit_mask;
+        uint64_t pairs = (digits | (digits >> 4)) & 0x00ff0000ff0000ffULL;
+        return uint32_t(pairs | (pairs >> 16) | (pairs >> 32)) & 0xffffff;
+#endif
+    }
+public:
+    Arrival arrival(Text ingest) const {
+        const char* p = ingest.data();
+        uint64_t month;
+        memcpy(&month, p, 8);
+        const auto& cached = ingest_days_[day_slot(p)];
+        if (cached.month_prefix == month) return {cached.order_base + clock_digits(p), cached.midnight};
+        int32_t day = utc_day(clock.iso<true>(ingest));
+        return {order_base(day) + clock_digits(p), Time(day) * day_ms};
+    }
     explicit Window(const fs::path& manifest) {
         std::ifstream f(manifest);
         std::string json((std::istreambuf_iterator<char>(f)), {});
@@ -392,7 +443,21 @@ struct Window {
         start = clock.parse(begin);
         end = clock.parse(field("window_end"));
         if (start == invalid_time || end == invalid_time || end <= start) throw std::runtime_error("invalid window");
+        using namespace std::chrono;
+        first_day_ = utc_day(start);
+        // Cache near-window dates. arrival() checks the month before using a slot.
+        int32_t last = std::min(utc_day(end - 1) + 6, first_day_ + 28);
+        for (int32_t day = first_day_ - 1; day <= last; ++day) {
+            year_month_day d{sys_days{days(day)}};
+            int y = int(d.year());
+            if (y < 0 || y > 9999) continue;
+            char date[16];
+            snprintf(date, sizeof date, "%04d-%02u-%02u", y, unsigned(d.month()), unsigned(d.day()));
+            auto& cached = ingest_days_[day_slot(date)];
+            memcpy(&cached.month_prefix, date, 8);
+            cached.midnight = Time(day) * day_ms;
+            cached.order_base = order_base(day);
+        }
     }
 };
-inline int32_t utc_day(Time t) { return int32_t(t / day_ms - (t % day_ms < 0)); }
 } // namespace shop
