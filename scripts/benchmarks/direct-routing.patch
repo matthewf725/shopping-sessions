@@ -1,0 +1,243 @@
+diff --git a/src/blocks.hpp b/src/blocks.hpp
+index 13eb28d..c03fc6b 100644
+--- a/src/blocks.hpp
++++ b/src/blocks.hpp
+@@ -114,16 +114,18 @@ public:
+       best->available -= bytes;
+       return ::new (ptr) U[n];
+   }
+-    void append(size_t shard, const T& row) {
++    T* append(size_t shard, const T& row) {
+         auto& c = shards_[shard];
+         if (c.next == c.limit)
+             extend(shard);
+-        *c.next++ = row;
++        T* slot = c.next++;
++        *slot = row;
++        return slot;
+     }
+ #if defined(__AVX512CD__)
+     // Reserve the first ready lane in each shard. Apply conflicting lanes in input order.
+     template <size_t W, class Slow>
+-    void append_lanes(__m512i shard, unsigned active, const __m512i (&cols)[W], Slow slow) {
++    __m512i append_lanes(__m512i shard, unsigned active, const __m512i (&cols)[W], Slow slow) {
+         static_assert(sizeof(T) == 8 * W && sizeof(Cursor) == 16);
+         auto indices = _mm512_slli_epi64(shard, 4);
+         auto next = _mm512_i64gather_epi64(indices, &shards_[0].next, 1);
+@@ -138,15 +140,19 @@ public:
+         for (size_t k = 0; k < W; ++k)
+             _mm512_mask_i64scatter_epi64(base + 8 * k, __mmask8(ready), address, cols[k], 1);
+         if (unsigned pending = active ^ ready) {
++            alignas(64) uintptr_t positions[8];
++            _mm512_store_si512(positions, next);
+             alignas(64) uint64_t data[W][8];
+             for (size_t k = 0; k < W; ++k)
+                 _mm512_store_si512(data[k], cols[k]);
+             do {
+                 unsigned i = std::countr_zero(pending);
+-                slow(i, data);
++                positions[i] = reinterpret_cast<uintptr_t>(slow(i, data));
+                 pending &= pending - 1;
+             } while (pending);
++            return _mm512_load_si512(positions);
+         }
++        return next;
+     }
+ #endif
+     size_t size(size_t shard) const {
+diff --git a/src/main.cpp b/src/main.cpp
+index 82d5deb..4a432db 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -18,8 +18,6 @@ inline size_t partition(Key key) { return hash_partition(hash_key(key)); }
+ constexpr uint32_t detailed = 0x80000000u;
+ struct PackedEvent { uint32_t when, tag; };
+ struct Detail { int64_t ingest_order; Event event; };
+-struct RawEvent { Key id_hash, person; PackedEvent event; };
+-static_assert(sizeof(RawEvent) == 24);
+ struct RawGroup {
+     Key key = 0;
+     size_t events = 0, clicks = 0;
+@@ -31,6 +29,10 @@ template<class T> struct Owned {
+ };
+ using OwnedEvent = Owned<PackedEvent>;
+ using OwnedClick = Owned<Click>;
++// Event storage stays at a stable address through the deduplication barrier.
++// Keep an exact key for invalid copies too, since they can suppress a valid copy.
++struct RawEvent { Key id_hash; OwnedEvent* row; };
++static_assert(sizeof(RawEvent) == 16);
+ struct Worker {
+     uint32_t number;
+     std::vector<Detail> details;
+@@ -120,7 +122,8 @@ struct Pipeline {
+         // Both xor-shifts and multiplication by an odd number are invertible
+         // on 64 bits. This hash is an exact event ID, and zero stays reserved.
+         Key id_hash = hash_key(id);
+-        w.parsed.append(hash_partition(id_hash), {id_hash, person, event});
++        auto* row = w.events.append(partition(person), {person, event});
++        w.parsed.append(hash_partition(id_hash), {id_hash, row});
+     }
+     void parse_events(Chunk chunk, Worker& w) {
+         auto consume = [&](Text eid, Text person, Text time, Text ingest, Text kind, bool has_product, auto purchase) {
+@@ -147,14 +150,22 @@ struct Pipeline {
+ #if defined(__AVX512BW__) && defined(__AVX512DQ__) && defined(__AVX512VL__) && defined(__AVX512CD__)
+         auto accelerate = [&](const char *data, const uint32_t *offsets, const uint16_t *rows,
+                               unsigned active = 255) {
+-            auto append = [&](Key id, Key person, uint64_t packed) {
+-                w.parsed.append(hash_partition(id), {id, person, {uint32_t(packed), uint32_t(packed >> 32)}});
+-            };
+             auto eight = [&](__m512i ids, __m512i people, __m512i values, unsigned active) {
+-                auto shards = _mm512_srli_epi64(ids, 64 - partition_bits);
+-                const __m512i cols[] = {ids, people, values};
+-                w.parsed.append_lanes(shards, active, cols,
+-                                      [&](unsigned i, const auto &v) { append(v[0][i], v[1][i], v[2][i]); });
++                auto hash = people ^ _mm512_srli_epi64(people, 32);
++                hash = _mm512_mullo_epi64(hash, _mm512_set1_epi64(0xd6e8feb86659fd93ULL));
++                hash ^= _mm512_srli_epi64(hash, 32);
++                const __m512i events[] = {people, values};
++                auto refs = w.events.append_lanes(_mm512_srli_epi64(hash, 64 - partition_bits), active, events,
++                    [&](unsigned i, const auto& v) {
++                        uint64_t packed = v[1][i];
++                        return w.events.append(partition(v[0][i]), {v[0][i], {uint32_t(packed), uint32_t(packed >> 32)}});
++                    });
++                const __m512i records[] = {ids, refs};
++                w.parsed.append_lanes(_mm512_srli_epi64(ids, 64 - partition_bits), active, records,
++                    [&](unsigned i, const auto& v) {
++                        return w.parsed.append(hash_partition(v[0][i]),
++                            {v[0][i], reinterpret_cast<OwnedEvent*>(v[1][i])});
++                    });
+             };
+             return EventLanes::run(window, data, offsets, rows, eight, active);
+         };
+@@ -230,7 +241,7 @@ struct Pipeline {
+         if (e.tag & detailed) return workers[e.tag ^ detailed].details[e.when].event;
+         return {window.start + e.when, 0, 0};
+     }
+-    void dedup(size_t p, Worker& dst) {
++    void dedup(size_t p) {
+         size_t size = 0;
+         for (auto& w : workers)
+             size += w.parsed.size(p);
+@@ -250,14 +261,10 @@ struct Pipeline {
+             word |= seen | ((word & seen) << 1);
+         };
+ #if defined(__AVX512CD__)
+-        // Three consecutive cache lines hold eight records. Extract the first
+-        // word of each record without eight separate memory gathers.
++        // Two cache lines hold eight exact IDs and their event pointers.
+         auto ids_from = [](const RawEvent* rows) {
+-            const char* bytes = reinterpret_cast<const char*>(rows);
+-            auto a = _mm512_loadu_si512(bytes), b = _mm512_loadu_si512(bytes + 64),
+-                 c = _mm512_loadu_si512(bytes + 128);
+-            auto first = _mm512_permutex2var_epi64(a, _mm512_setr_epi64(0, 3, 6, 9, 12, 15, 0, 0), b);
+-            return _mm512_mask_permutexvar_epi64(first, 0xc0, _mm512_setr_epi64(0, 0, 0, 0, 0, 0, 2, 5), c);
++            return _mm512_permutex2var_epi64(_mm512_loadu_si512(rows),
++                _mm512_setr_epi64(0, 2, 4, 6, 8, 10, 12, 14), _mm512_loadu_si512(rows + 4));
+         };
+         auto one = _mm512_set1_epi64(1), low = _mm512_set1_epi64(31), mask = _mm512_set1_epi64(slot_mask);
+ #endif
+@@ -282,16 +289,14 @@ struct Pipeline {
+                 for (; i < rows.size(); ++i)
+                     record(rows[i].id_hash);
+             });
+-        FlatMap<RawEvent*, std::identity{}> best(size / 10);
+-        auto emit = [&](const RawEvent& row) {
+-            if (row.person) {
+-                dst.events.append(partition(row.person), {row.person, row.event});
+-            }
+-        };
+-        auto repeat = [&](RawEvent& row) {
+-            auto [prev, fresh] = best.add(row.id_hash, &row);
+-            if (!fresh && ingest_order(row.event) < ingest_order(prev->event))
+-                prev = &row;
++        FlatMap<OwnedEvent*, std::identity{}> best(size / 10);
++        auto repeat = [&](const RawEvent& record) {
++            auto* candidate = record.row;
++            auto [winner, fresh] = best.add(record.id_hash, candidate);
++            if (fresh) return;
++            if (ingest_order(candidate->value) < ingest_order(winner->value))
++                std::swap(winner, candidate);
++            candidate->person = 0;
+         };
+         for (auto& w : workers)
+             w.parsed.visit(p, [&](auto rows) {
+@@ -302,23 +307,6 @@ struct Pipeline {
+                     auto data = _mm512_i64gather_epi64(_mm512_srli_epi64(slot, 5), filter.data(), 8);
+                     auto bits = _mm512_sllv_epi64(_mm512_set1_epi64(2), _mm512_slli_epi64(slot & low, 1));
+                     unsigned hit = _mm512_test_epi64_mask(data, bits);
+-                    const auto *mem = reinterpret_cast<const char *>(rows.data() + i);
+-                    const auto a = _mm512_loadu_si512(mem), b = _mm512_loadu_si512(mem + 64),
+-                               c = _mm512_loadu_si512(mem + 128);
+-                    auto names = _mm512_permutex2var_epi64(a, _mm512_setr_epi64(1, 4, 7, 10, 13, 0, 0, 0), b);
+-                    names = _mm512_mask_permutexvar_epi64(names, 0xe0,
+-                                                          _mm512_setr_epi64(0, 0, 0, 0, 0, 0, 3, 6), c);
+-                    auto values =
+-                        _mm512_permutex2var_epi64(a, _mm512_setr_epi64(2, 5, 8, 11, 14, 0, 0, 0), b);
+-                    values = _mm512_mask_permutexvar_epi64(values, 0xe0,
+-                                                           _mm512_setr_epi64(0, 0, 0, 0, 0, 1, 4, 7), c);
+-                    auto h = names ^ _mm512_srli_epi64(names, 32);
+-                    h = _mm512_mullo_epi64(h, _mm512_set1_epi64(0xd6e8feb86659fd93ULL));
+-                    h ^= _mm512_srli_epi64(h, 32);
+-                    const __m512i cols[] = {names, values};
+-                    unsigned active = (255 ^ hit) & _mm512_test_epi64_mask(names, names);
+-                    dst.events.append_lanes(_mm512_srli_epi64(h, 64 - partition_bits), active, cols,
+-                                            [&](unsigned j, const auto &) { emit(rows[i + j]); });
+                     for (; hit; hit &= hit - 1)
+                         repeat(rows[i + std::countr_zero(hit)]);
+                 }
+@@ -329,13 +317,8 @@ struct Pipeline {
+                     uint64_t repeated = uint64_t(2) << (2 * (slot & 31));
+                     if (filter[slot >> 5] & repeated)
+                         repeat(row);
+-                    else
+-                        emit(row);
+                 }
+             });
+-        for (const auto& slot : best.slots())
+-            if (slot.key)
+-                emit(*slot.value);
+     }
+     void group_aliases(size_t p, Worker& dst) {
+         using Group = RawGroup;
+@@ -350,6 +333,7 @@ struct Pipeline {
+         // Both the primary array and deque preserve group addresses. Once a
+         // row has found its group, its next pass can write directly to it.
+         std::vector<Group> primary(capacity);
++        Group rejected;
+         std::deque<Group> overflow;
+         std::vector<Group*> used;
+         used.reserve(capacity / 2);
+@@ -374,7 +358,7 @@ struct Pipeline {
+         for (auto& w : workers) {
+             w.events.visit(p, [&](auto rows) {
+                 for (auto& e : rows) {
+-                    auto* g = lookup(e.person);
++                    auto* g = e.person ? lookup(e.person) : &rejected;
+                     ++g->events;
+                     e.group = g;
+                 }
+@@ -387,6 +371,7 @@ struct Pipeline {
+                 }
+             });
+         }
++        if (rejected.events) used.push_back(&rejected);
+         size_t en = 0, cn = 0;
+         for (auto* entry : used) {
+             auto& g = *entry;
+@@ -460,6 +445,7 @@ struct Pipeline {
+                     ck[c.group->clicks++] = c.value;
+             });
+         }
++        if (!used.empty() && used.back() == &rejected) used.pop_back();
+         size_t e0 = 0, c0 = 0;
+         for (auto* entry : used) {
+             auto& g = *entry;
+@@ -488,7 +474,7 @@ struct Pipeline {
+     }
+     void run(const fs::path& data, const fs::path& output, Profile& profile) {
+         read(data); profile.mark("parse and link");
+-        parallel(workers.size(), partitions, [&](size_t wi, size_t p) { dedup(p, workers[wi]); });
++        parallel(workers.size(), partitions, [&](size_t, size_t p) { dedup(p); });
+         for (auto& w : workers)
+             w.parsed.recycle_pages();
+         profile.mark("deduplicate and partition");
