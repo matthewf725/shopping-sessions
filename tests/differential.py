@@ -221,6 +221,20 @@ def chunk_boundaries(data):
         pad = 'x' * (512 * 1024 + delta - len(header) - len(first))
         giant = f'e{i}c,u1,{start},{start},view,p1,' + 'x' * (2 * 512 * 1024 + 7)
         (data / 'events' / f'{i}.csv').write_text(header + first + pad + '\n' + giant + '\n' + tail)
+    # The vector reader can reuse a UTC date for a signed offset. Exercise both
+    # UTC day crossings and invalid offsets in rows that still participate in dedup.
+    offsets = ['+00:00', '-00:00', '+05:45', '-03:30', '+23:59', '-23:59',
+               '+24:00', '+03:60', '/03:00', '-0x:30', '+05;30', '+05:3x']
+    with (data / 'events' / 'zoned.csv').open('w') as f:
+        f.write(header)
+        for block, clock in enumerate(('00:01:00', '12:00:00', '23:59:59')):
+            for lane, zone in enumerate(offsets):
+                eid = f'e{block:04d}{lane:04d}'
+                stamp = f'2025-01-01T{clock}{zone}'
+                kind = ('cart', 'purchase', 'view')[lane % 3]
+                f.write(f'{eid},u12345678,"{stamp}",2025-01-01T23:59:59Z,{kind},p1,57\n')
+                f.write(f'{eid},u87654321,{start},2025-01-02T00:00:00Z,purchase,p1,999\n')
+
     # Move quote errors through vector boundaries, with a valid physical line on either side.
     with (data / 'events' / 'quotes.csv').open('w') as f:
         f.write(header)

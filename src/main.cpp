@@ -114,7 +114,7 @@ struct Pipeline {
         workers.reserve(n);
         for (size_t i = 0; i < n; ++i) workers.emplace_back(uint32_t(i), window, dim, click_keys);
     }
-    void store_event(Worker& w, Key id, Key person, Time ts, int64_t order, uint32_t price, uint32_t category) {
+    void store_event(Worker& w, Key id_hash, Key person, Time ts, int64_t order, uint32_t price, uint32_t category) {
         uint64_t when = person ? uint64_t(ts - window.start) : 0;
         PackedEvent event;
         if (!price && when <= UINT32_MAX && uint64_t(order) < detailed) {
@@ -125,8 +125,27 @@ struct Pipeline {
         }
         // Both xor-shifts and multiplication by an odd number are invertible
         // on 64 bits. This hash is an exact event ID, and zero stays reserved.
-        Key id_hash = hash_key(id);
         w.parsed.append(hash_partition(id_hash), {id_hash, person, event});
+    }
+    template<class Person, class Purchase>
+    void finish_event(Worker& w, Key id_hash, Time ts, Window::Arrival arrival, Text ingest,
+                      Text kind, bool has_person_and_product, Person person, Purchase purchase) {
+        uint32_t price = 0, category = 0;
+        bool valid = has_person_and_product && ts >= window.start && ts < window.end && arrival.on_time(ts, ingest);
+        if (valid && kind == "purchase") {
+            auto [product, cents] = purchase();
+            int64_t amount = decimal(cents, 10'000'000);
+            valid = amount > 0;
+            if (valid) {
+                price = uint32_t(amount);
+                category = dim.products.get(product);
+                if (!category) category = dim.unknown;
+            }
+        } else if (valid) {
+            valid = kind == "view" || kind == "cart";
+        }
+        // An invalid earlier copy still participates in event-ID deduplication.
+        store_event(w, id_hash, valid ? person() : 0, ts, arrival.order, price, category);
     }
     void parse_events(Chunk chunk, Worker& w, unsigned mode = 0) {
         auto consume = [&](Text eid, Text person, Text time, Text ingest, Text kind, bool has_product, auto purchase) {
@@ -134,21 +153,8 @@ struct Pipeline {
             if (!id || ingest.size() != 20) return;
             auto arrival = window.arrival(ingest);
             Time ts = window.event_time(time, ingest, arrival.midnight);
-            uint32_t price = 0, category = 0;
-            bool valid = !person.empty() && has_product && ts >= window.start && ts < window.end &&
-                         arrival.on_time(ts, ingest);
-            if (valid && kind == "purchase") {
-                auto [product, cents] = purchase();
-                int64_t p = decimal(cents, 10'000'000);
-                valid = p > 0;
-                if (valid) {
-                    price = uint32_t(p);
-                    category = dim.products.get(product);
-                    if (!category) category = dim.unknown;
-                }
-            } else if (valid) valid = kind == "view" || kind == "cart";
-            // Keep invalid copies by event ID so the earliest ingestion still wins.
-            store_event(w, id, valid ? users.encode(person) : 0, ts, arrival.order, price, category);
+            finish_event(w, hash_key(id), ts, arrival, ingest, kind, !person.empty() && has_product,
+                         [&] { return users.encode(person); }, purchase);
         };
         auto fields = [&](const auto& f) {
             consume(f[0], f[1], f[2], f[3], f[4], !f[5].empty(), [&] { return std::pair{f[5], f[6]}; });
@@ -167,7 +173,20 @@ struct Pipeline {
                 w.parsed.append_lanes(shards, active, cols,
                                       [&](unsigned i, const auto &v) { append(v[0][i], v[1][i], v[2][i]); });
             };
-            return EventLanes::run(window, data, offsets, rows, eight, active, mode == 3);
+            auto complete = [&](unsigned lane, Key id_hash, Key person, uint32_t order,
+                                Time midnight, Time decoded_time, bool has_time) {
+                const uint32_t* cuts = offsets + rows[lane];
+                auto field = [&](unsigned column) {
+                    return CsvTile<7>::field(data + uint32_t(cuts[column] + 1), data + cuts[column + 1]);
+                };
+                auto ingest = field(3);
+                Time ts = has_time ? decoded_time : window.event_time(field(2), ingest, midnight);
+                const char* product = data + cuts[5] + 1;
+                bool has_product = *product != ',' && !(*product == '"' && product[1] == '"');
+                finish_event(w, id_hash, ts, {order, midnight}, ingest, field(4), has_product,
+                             [&] { return person; }, [&] { return std::pair{field(5), field(6)}; });
+            };
+            return EventLanes::run(window, data, offsets, rows, eight, complete, active, mode == 3);
         };
         auto projection = BatchProjection{consume, accelerate};
 #else
@@ -248,7 +267,18 @@ struct Pipeline {
         }
         const size_t click_start = 1 + ev.chunks.size();
         const size_t jobs = click_start + ck.chunks.size();
-        std::atomic<size_t> next{0};
+        struct alignas(64) FileRange {
+            std::atomic<size_t> next{0};
+            size_t end = 0;
+        };
+        size_t count = workers.size();
+        auto ranges = std::make_unique<FileRange[]>(count);
+        auto boundary = [&](size_t i) { return i * (jobs / count) + std::min(i, jobs % count); };
+        for (size_t i = 0; i < count; ++i) {
+            ranges[i].next.store(boundary(i), std::memory_order_relaxed);
+            ranges[i].end = boundary(i + 1);
+        }
+        bool observe_io = std::getenv("PROFILE") != nullptr;
         std::atomic<bool> reading_blocks{false};
 #if defined(__AVX512CD__)
         ParserChoice event_reader, click_reader;
@@ -256,37 +286,40 @@ struct Pipeline {
         parallel(workers.size(), workers.size(), [&](size_t wi, size_t) {
             auto& input = inputs[wi];
             auto& worker = workers[wi];
-            // Sampling measures this thread's completed filesystem reads. On a storage miss,
-            // reserving consecutive chunks gives Linux a sequential stream for this descriptor.
             unsigned pieces = 0;
-            for (;;) {
-                bool from_storage = reading_blocks.load(std::memory_order_relaxed);
-                size_t stride = from_storage ? 8 : 1;
-                size_t first = next.fetch_add(stride, std::memory_order_relaxed);
-                if (first >= jobs) break;
-                size_t stop = std::min(first + stride, jobs);
-                for (size_t j = first; j < stop; ++j) {
-                    if (j == 0) {
-                        people.build(links, users);
-                        continue;
-                    }
-                    bool event = j < click_start;
-                    const FilePiece& piece = event ? ev.chunks[j - 1] : ck.chunks[j - click_start];
-                    bool sample = !from_storage && ((pieces++ & 31) == 0);
-                    long before = sample ? input_blocks() : 0;
-                    Chunk chunk = input.read(piece);
-                    if (sample && input_blocks() > before) {
-                        reading_blocks.store(true, std::memory_order_relaxed);
-                        from_storage = true;
-                    }
+            auto read_piece = [&](size_t j) {
+                if (j == 0) {
+                    people.build(links, users);
+                    return;
+                }
+                bool event = j < click_start;
+                const FilePiece& piece = event ? ev.chunks[j - 1] : ck.chunks[j - click_start];
+                bool sample = observe_io && ((pieces++ & 31) == 0) &&
+                              !reading_blocks.load(std::memory_order_relaxed);
+                long before = sample ? input_blocks() : 0;
+                Chunk chunk = input.read(piece);
+                if (sample && input_blocks() > before) {
+                    reading_blocks.store(true, std::memory_order_relaxed);
+                }
 #if defined(__AVX512CD__)
-                    size_t bytes = size_t(chunk.limit - chunk.begin);
-                    if (event) event_reader.run(bytes, [&](unsigned mode) { parse_events(chunk, worker, mode); });
-                    else click_reader.run(bytes, [&](unsigned mode) { parse_clicks(chunk, worker, mode); });
+                size_t bytes = size_t(chunk.limit - chunk.begin);
+                if (event) event_reader.run(bytes, [&](unsigned mode) { parse_events(chunk, worker, mode); });
+                else click_reader.run(bytes, [&](unsigned mode) { parse_clicks(chunk, worker, mode); });
 #else
-                    if (event) parse_events(chunk, worker);
-                    else parse_clicks(chunk, worker);
+                if (event) parse_events(chunk, worker);
+                else parse_clicks(chunk, worker);
 #endif
+            };
+            // Start one sequential stream per worker. An idle worker can take
+            // unclaimed pieces from the other ranges, including the final short range.
+            constexpr size_t batch = 8;
+            for (size_t i = 0; i < count; ++i) {
+                auto& range = ranges[(wi + i) % count];
+                for (;;) {
+                    size_t first = range.next.fetch_add(batch, std::memory_order_relaxed);
+                    if (first >= range.end) break;
+                    size_t stop = first + std::min(batch, range.end - first);
+                    for (size_t j = first; j < stop; ++j) read_piece(j);
                 }
             }
         });

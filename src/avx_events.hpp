@@ -137,9 +137,27 @@ struct EventLanes {
         V groups = _mm512_madd_epi16(pairs, _mm512_set1_epi32(0x00010064));
         return _mm512_add_epi64(_mm512_mul_epu32(groups, number(10000)), _mm512_srli_epi64(groups, 32));
     }
-    template <class Store>
+
+    // The high and low groups occupy adjacent 32-bit lanes after the shuffle.
+    // Each 64-bit result is five actual digits times 10^8 plus eight digits.
+    static V whole_epoch(V head, V tail, M& valid) {
+        V upper = _mm512_slli_epi64(_mm512_sub_epi8(head, _mm512_set1_epi8('0')), 24);
+        V lower = _mm512_sub_epi8(tail, _mm512_set1_epi8('0'));
+        V faults = _mm512_subs_epu8(_mm512_max_epu8(upper, lower), _mm512_set1_epi8(9));
+        valid &= _mm512_cmpeq_epi64_mask(faults, number(0));
+        auto quads = [](V digits) {
+            V pairs = _mm512_maddubs_epi16(digits, _mm512_set1_epi16(0x010a));
+            return _mm512_madd_epi16(pairs, _mm512_set1_epi32(0x00010064));
+        };
+        V small = _mm512_packs_epi32(quads(upper), quads(lower));
+        V eights = _mm512_madd_epi16(small, _mm512_set1_epi32(0x00012710));
+        V paired = _mm512_shuffle_epi32(eights, _MM_PERM_DBCA);
+        return _mm512_add_epi64(_mm512_mul_epu32(paired, number(100000000)),
+                                _mm512_srli_epi64(paired, 32));
+    }
+    template <class Store, class Complete>
     static M run(const Window &window, const char *data, const uint32_t *cuts, const uint16_t *rows,
-                 Store store, unsigned active = 255, bool packed = false) {
+                 Store store, Complete complete, unsigned active = 255, bool packed = false) {
         I boundaries[6];
         field_offsets<7>(cuts, rows, packed, boundaries);
         Field id = field(data, boundaries[0], boundaries[1]),
@@ -147,26 +165,26 @@ struct EventLanes {
         Field time = field(data, boundaries[2], boundaries[3]),
               ingest = field(data, boundaries[3], boundaries[4]);
         Field kind = field(data, boundaries[4], boundaries[5]);
-        M good = _mm256_cmpeq_epi32_mask(ingest.size, integer(20)) &
-                 _mm256_cmpeq_epi32_mask(kind.size, integer(4));
+        M known = _mm256_cmpeq_epi32_mask(ingest.size, integer(20));
+        M good = _mm256_cmpeq_epi32_mask(kind.size, integer(4));
         V type = kind.head & number(UINT32_MAX);
         good &= _mm512_cmpeq_epi64_mask(type, number(0x77656976)) |
                 _mm512_cmpeq_epi64_mask(type, number(0x74726163));
         V product = load8(data + 1, boundaries[5]);
         good &= ~(_mm512_cmpeq_epi64_mask(product & number(255), number(',')) |
                   _mm512_cmpeq_epi64_mask(product & number(65535), number(0x2222)));
-        V event_key = keys(data, id, 'e', good), person = keys(data, user, 'u', good);
+        V event_key = keys(data, id, 'e', known), person = keys(data, user, 'u', known);
         V ingest_month = load8(data, ingest.start), ingest_day = load8(data + 8, ingest.start);
         V slot =
             _mm512_slli_epi64(ingest_day & number(3), 4) | (_mm512_srli_epi64(ingest_day, 8) & number(15));
         I ci = _mm512_cvtepi64_epi32(_mm512_add_epi64(slot, _mm512_slli_epi64(slot, 1)));
         static_assert(sizeof(Window::IngestDay) == 24 && sizeof(Window::EpochPrefix) == 16);
         const auto* days = window.ingest_days_.data();
-        good &= _mm512_cmpeq_epi64_mask(ingest_month, lookup(&days->month_prefix, ci));
+        known &= _mm512_cmpeq_epi64_mask(ingest_month, lookup(&days->month_prefix, ci));
         V midnight = lookup(&days->midnight, ci);
         V order =
             _mm512_add_epi64(lookup(&days->order_base, ci), clock_order(load8(data + 11, ingest.start)));
-        good &= _mm512_cmp_epu64_mask(order, number(0x80000000u), _MM_CMPINT_LT);
+        known &= _mm512_cmp_epu64_mask(order, number(0x80000000u), _MM_CMPINT_LT);
         V time_head = load8(data, time.start);
         M iso = _mm256_cmpeq_epi32_mask(time.size, integer(20));
         iso &= _mm512_cmpeq_epi64_mask(time_head, ingest_month);
@@ -175,28 +193,55 @@ struct EventLanes {
         iso &= _mm512_cmpeq_epi64_mask(load8(data + 19, time.start) & number(255), number('Z'));
         V iso_secs = seconds(load8(data + 11, time.start), iso);
         V iso_ts = _mm512_add_epi64(midnight, _mm512_mul_epu32(iso_secs, number(1000)));
+        M zoned = _mm256_cmpeq_epi32_mask(time.size, integer(25));
+        if (zoned & active) {
+            // A same-date numeric offset can share the UTC ingestion's date anchor.
+            // Validate the entire zone before it contributes to a timestamp.
+            zoned &= _mm512_cmpeq_epi64_mask(time_head, ingest_month) &
+                     _mm512_cmpeq_epi64_mask((load8(data + 8, time.start) ^ ingest_day) & number(0xffffff), number(0));
+            V tail = load8(data + 19, time.start);
+            V sign = tail & number(255);
+            M plus = _mm512_cmpeq_epi64_mask(sign, number('+'));
+            zoned &= plus | _mm512_cmpeq_epi64_mask(sign, number('-'));
+            V zone_clock = (_mm512_srli_epi64(tail, 8) & number(0xffffffffffULL)) | number(0x30303a0000000000ULL);
+            V zone_secs = seconds(zone_clock, zoned);
+            V wall_secs = seconds(load8(data + 11, time.start), zoned);
+            V local_ts = _mm512_add_epi64(midnight, _mm512_mul_epu32(wall_secs, number(1000)));
+            V correction = _mm512_mul_epu32(zone_secs, number(1000));
+            V signed_delta = _mm512_mask_sub_epi64(correction, plus, number(0), correction);
+            iso_ts = _mm512_mask_add_epi64(iso_ts, zoned, local_ts, signed_delta);
+            iso |= zoned;
+        }
         M epoch = _mm256_cmpeq_epi32_mask(time.size, integer(13));
-        V eslot = _mm512_slli_epi64(_mm512_srli_epi64(time_head, 24) & number(3), 4) |
-                  (_mm512_srli_epi64(time_head, 32) & number(15));
-        I ei = _mm512_cvtepi64_epi32(_mm512_slli_epi64(eslot, 1));
-        const auto* prefixes = window.epoch_prefixes_.data();
-        V prefix = lookup(&prefixes->text, ei);
-        epoch &= _mm512_cmpeq_epi64_mask(prefix, time_head & number(0xffffffffffULL)) &
-                 _mm512_cmpneq_epi64_mask(prefix, number(0));
-        V epoch_ts =
-            _mm512_add_epi64(lookup(&prefixes->base, ei), decimal8(load8(data + 5, time.start), epoch));
+        V epoch_ts = whole_epoch(time_head, load8(data + 5, time.start), epoch);
         good &= iso | epoch;
         V ts = _mm512_mask_blend_epi64(iso, epoch_ts, iso_ts);
         good &= _mm512_cmp_epi64_mask(ts, midnight, _MM_CMPINT_GE) &
                 _mm512_cmp_epi64_mask(ts, number(window.end), _MM_CMPINT_LT);
         V when = _mm512_sub_epi64(ts, number(window.start));
         good &= _mm512_cmp_epu64_mask(when, number(UINT32_MAX), _MM_CMPINT_LE);
-        good &= active;
+        known &= active;
+        good &= known;
         V hk = event_key ^ _mm512_srli_epi64(event_key, 32);
         hk = _mm512_mullo_epi64(hk, number(0xd6e8feb86659fd93ULL));
         hk ^= _mm512_srli_epi64(hk, 32);
         store(hk, person, _mm512_slli_epi64(order, 32) | when, unsigned(good));
-        return good;
+        // Other valid ID/ingestion combinations reuse the exact fields decoded above.
+        unsigned extra = known & ~good;
+        if (extra) {
+            alignas(64) uint64_t ids[8], persons[8], orders[8];
+            alignas(64) int64_t midnights[8], times[8];
+            _mm512_store_si512(ids, hk);
+            _mm512_store_si512(persons, person);
+            _mm512_store_si512(orders, order);
+            _mm512_store_si512(midnights, midnight);
+            _mm512_store_si512(times, ts);
+            for (; extra; extra &= extra - 1) {
+                unsigned i = std::countr_zero(extra);
+                complete(i, ids[i], persons[i], uint32_t(orders[i]), midnights[i], times[i], ((iso | epoch) >> i) & 1);
+            }
+        }
+        return known;
     }
 };
 struct ClickLanes : EventLanes {
@@ -240,15 +285,7 @@ struct ClickLanes : EventLanes {
             _mm512_add_epi64(lookup(&days->midnight, di),
                              _mm512_mul_epu32(seconds(load8(data + 11, time.start), iso), number(1000)));
         M epoch = _mm256_cmpeq_epi32_mask(time.size, integer(13));
-        V eslot = _mm512_slli_epi64(_mm512_srli_epi64(head, 24) & number(3), 4) |
-                  (_mm512_srli_epi64(head, 32) & number(15));
-        I ei = _mm512_cvtepi64_epi32(_mm512_slli_epi64(eslot, 1));
-        const auto* pref = window.epoch_prefixes_.data();
-        V prefix = lookup(&pref->text, ei);
-        epoch &= _mm512_cmpeq_epi64_mask(head & number(0xffffffffffULL), prefix) &
-                 _mm512_cmpneq_epi64_mask(prefix, number(0));
-        V epoch_time =
-            _mm512_add_epi64(lookup(&pref->base, ei), decimal8(load8(data + 5, time.start), epoch));
+        V epoch_time = whole_epoch(head, load8(data + 5, time.start), epoch);
         V ts = _mm512_mask_blend_epi64(iso, epoch_time, iso_time);
         good &= (iso | epoch) & _mm512_cmp_epi64_mask(ts, number(window.start - week_ms), _MM_CMPINT_GE) &
                 _mm512_cmp_epi64_mask(ts, number(window.end), _MM_CMPINT_LT);
