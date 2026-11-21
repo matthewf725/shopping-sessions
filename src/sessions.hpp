@@ -41,6 +41,12 @@ public:
         if (credits_.empty()) return sparse_[i];
         return credits_[i];
     }
+    void count_assists(uint32_t campaign, int32_t day, unsigned count) {
+        if (assists_.empty())
+            sparse_[cell(campaign, day)].assists += count;
+        else
+            assists_[size_t(campaign) * days_ + size_t(day - first_)] += count;
+    }
     void add_assists(uint32_t campaign, const SessionDay* day, size_t first, size_t stop) {
         int64_t* counts = assists_.empty() ? nullptr : assists_.data() + campaign * days_;
         for (; first < stop; ++day) {
@@ -109,6 +115,12 @@ class Shopper {
     std::vector<AssistRange> coverage_;
     std::vector<size_t> touched_;
     std::unordered_map<size_t, AssistRange> sparse_coverage_;
+    enum class AssistMethod { week, mask, positions };
+    AssistMethod method_ = AssistMethod::positions;
+    std::vector<uint64_t> campaign_masks_;
+    std::vector<size_t> covered_until_;
+    std::vector<uint32_t> active_campaigns_;
+    std::vector<Click> ordered_clicks_, radix_clicks_;
     size_t campaign_count_;
     size_t first_word_ = 0, last_word_ = 0;
     bool indexed_ = false;
@@ -275,7 +287,18 @@ class Shopper {
         if ((word & bit) && (inclusive ? sessions_[n].start <= t : sessions_[n].start < t)) ++n;
         return n;
     }
-    void attribute(const Segment* chain, CampaignDays& campaigns) {
+    void credit_sessions(CampaignDays& campaigns) {
+        Click latest{invalid_time, 0, 0};
+        for (const auto& s : sessions_) {
+            if (s.credit.id) latest = s.credit;
+            uint32_t credited = latest.ts >= s.start - week_ms ? latest.campaign : 0;
+            auto& t = campaigns.credited(credited, s.day);
+            ++t.sessions;
+            t.purchasing += (s.revenue > 0);
+            t.revenue += s.revenue;
+        }
+    }
+    void week_assists(const Segment* chain, CampaignDays& campaigns) {
         for (auto seg = chain; seg; seg = seg->next) for (uint32_t i = 0; i < seg->m; ++i) {
             const Click& c = seg->clicks[i];
             size_t first = rank(c.ts, false);
@@ -309,19 +332,141 @@ class Shopper {
             assists(at, range, next == sparse_coverage_.end() ? SIZE_MAX : next->second.first_session);
         }
         sparse_coverage_.clear();
-        Click latest{invalid_time, 0, 0};
-        for (const auto& s : sessions_) {
-            if (s.credit.id) latest = s.credit;
-            uint32_t credited = latest.ts >= s.start - week_ms ? latest.campaign : 0;
-            auto& t = campaigns.credited(credited, s.day);
-            ++t.sessions;
-            t.purchasing += (s.revenue > 0);
-            t.revenue += s.revenue;
+    }
+    void mask_assists(const Segment* chain, CampaignDays& campaigns) {
+        for (auto seg = chain; seg; seg = seg->next) {
+            for (uint32_t i = 0; i < seg->m; ++i) {
+                const Click& click = seg->clicks[i];
+                size_t first = rank(click.ts, false);
+                if (first == sessions_.size() || sessions_[first].start - click.ts > week_ms)
+                    continue;
+                auto& winner = sessions_[first].credit;
+                if (click.ts > winner.ts || (click.ts == winner.ts && click_keys_.less(click.id, winner.id)))
+                    winner = click;
+                size_t stop = rank(click.ts + week_ms, true);
+                uint64_t through_last = stop == 64 ? UINT64_MAX : (uint64_t{1} << stop) - 1;
+                auto& covered = campaign_masks_[click.campaign];
+                if (!covered)
+                    active_campaigns_.push_back(click.campaign);
+                covered |= through_last & (UINT64_MAX << first);
+            }
         }
+        for (uint32_t campaign : active_campaigns_) {
+            uint64_t remaining = std::exchange(campaign_masks_[campaign], 0);
+            while (remaining) {
+                size_t first = std::countr_zero(remaining);
+                const auto& day = session_days_[sessions_[first].day_index];
+                uint64_t today = remaining;
+                if (day.stop < 64)
+                    today &= (uint64_t{1} << day.stop) - 1;
+                campaigns.count_assists(campaign, day.day, std::popcount(today));
+                remaining ^= today;
+            }
+        }
+        active_campaigns_.clear();
+    }
+    void order_clicks(const Segment *chain) {
+        ordered_clicks_.clear();
+        uint64_t varying = 0;
+        bool ordered = true;
+        const Time earliest = sessions_.front().start - week_ms;
+        const Time latest = sessions_.back().start;
+        for (auto seg = chain; seg; seg = seg->next) {
+            for (uint32_t i = 0; i < seg->m; ++i) {
+                const auto &c = seg->clicks[i];
+                if (c.ts < earliest || c.ts > latest)
+                    continue;
+                if (!ordered_clicks_.empty()) {
+                    ordered &= ordered_clicks_.back().ts <= c.ts;
+                    varying |= uint64_t(c.ts) ^ uint64_t(ordered_clicks_.front().ts);
+                }
+                ordered_clicks_.push_back(c);
+            }
+        }
+        if (ordered)
+            return;
+        if (ordered_clicks_.size() <= 32) {
+            // The small-set path has a fixed upper bound.
+            for (size_t i = 1; i < ordered_clicks_.size(); ++i) {
+                Click c = ordered_clicks_[i];
+                size_t j = i;
+                while (j && ordered_clicks_[j - 1].ts > c.ts) {
+                    ordered_clicks_[j] = ordered_clicks_[j - 1];
+                    --j;
+                }
+                ordered_clicks_[j] = c;
+            }
+            return;
+        }
+        radix_clicks_.resize(ordered_clicks_.size());
+        for (unsigned shift = 0; shift < 64; shift += 8) {
+            if (!(varying & (uint64_t{255} << shift)))
+                continue;
+            auto digit = [shift](Time t) {
+                return uint8_t((uint64_t(t) ^ (uint64_t{1} << 63)) >> shift);
+            };
+            std::array<size_t, 256> counts{};
+            for (const auto &c : ordered_clicks_)
+                ++counts[digit(c.ts)];
+            size_t offset = 0;
+            for (auto &n : counts) {
+                size_t next = offset + n;
+                n = offset;
+                offset = next;
+            }
+            for (const auto &c : ordered_clicks_)
+                radix_clicks_[counts[digit(c.ts)]++] = c;
+            ordered_clicks_.swap(radix_clicks_);
+        }
+    }
+
+    void position_assists(const Segment* chain, CampaignDays& campaigns) {
+        order_clicks(chain);
+        size_t first = 0, stop = 0;
+        for (const Click& click : ordered_clicks_) {
+            while (first < sessions_.size() && sessions_[first].start < click.ts)
+                ++first;
+            stop = std::max(first, stop);
+            while (stop < sessions_.size() && sessions_[stop].start - click.ts <= week_ms)
+                ++stop;
+            if (first == stop)
+                continue;
+            auto& winner = sessions_[first].credit;
+            if (click.ts > winner.ts || (click.ts == winner.ts && click_keys_.less(click.id, winner.id)))
+                winner = click;
+            auto& previous_stop = covered_until_[click.campaign];
+            size_t next = std::max(first, previous_stop);
+            if (next == stop)
+                continue;
+            if (!previous_stop)
+                active_campaigns_.push_back(click.campaign);
+            campaigns.add_assists(click.campaign, session_days_.data() + sessions_[next].day_index, next, stop);
+            previous_stop = stop;
+        }
+        for (uint32_t campaign : active_campaigns_)
+            covered_until_[campaign] = 0;
+        active_campaigns_.clear();
+    }
+    void attribute(const Segment* chain, CampaignDays& campaigns) {
+        if (method_ != AssistMethod::week && sessions_.size() <= 64)
+            mask_assists(chain, campaigns);
+        else if (method_ == AssistMethod::positions)
+            position_assists(chain, campaigns);
+        else
+            week_assists(chain, campaigns);
+        credit_sessions(campaigns);
     }
 public:
     Shopper(const Window& w, const Dimensions& d, const Keys& click_keys)
         : origin_(w.start), click_keys_(click_keys), category_sums_(d.categories.size()+1), campaign_count_(d.names.size()) {
+        if (const char* value = std::getenv("SHOP_ASSISTS")) {
+            std::string_view method(value);
+            if (method == "week") method_ = AssistMethod::week;
+            else if (method == "mask") method_ = AssistMethod::mask;
+            else if (method != "positions") throw std::runtime_error("unknown SHOP_ASSISTS method");
+        }
+        if (method_ != AssistMethod::week) campaign_masks_.resize(campaign_count_);
+        if (method_ == AssistMethod::positions) covered_until_.resize(campaign_count_);
         vector_window_ = uint64_t(w.end - w.start - 1) <= UINT32_MAX;
         size_t weeks = size_t((w.end - w.start - 1) / week_ms) + 2;
         if (weeks <= 1'000'000 / campaign_count_) coverage_.resize(weeks * campaign_count_);

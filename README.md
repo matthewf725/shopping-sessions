@@ -127,3 +127,34 @@ To select the zero-based `k`th exception, the range's exact density predicts a r
 Seed 211 had 21,434,677 physical rows and 3,244,877 exceptions. The index returned identical answers to the explicitly stored exception list for 20,006 counts and 20,010 selections. The millionth exception was at row 6,604,305, 21 words from its predicted location. Across the sampled nonempty ranges the median error was 21 words and the 99th percentile was 100 words.
 
 Build with `c++ -O3 -march=native -std=c++20 -Isrc scripts/shape_index.cpp -o /tmp/shape-index`. Run `/tmp/shape-index DATA` and enter `first stop` to count exceptions. With `--select`, enter `first stop k` to get the physical row number or `none`. With `--list`, enter `first stop` to print the original row, filename and byte-offset listing. Run `python3 tests/shape_index.py /tmp/shape-index` to check shuffled and clustered layouts. The timed pipeline reads its own fresh CSV input directly.
+
+### Session-position experiment
+
+This branch has three exact campaign-assist methods. Set `SHOP_ASSISTS=week` to use the existing weekly ranges. With `SHOP_ASSISTS=mask`, a shopper with at most 64 sessions gets one word per touched campaign. Clicks set an inclusive seven-day range of session positions. Popcounts by session-start day produce distinct assists. Larger shoppers use weekly ranges. The default, `SHOP_ASSISTS=positions`, uses the same word for small shoppers and advances the rightmost counted session for each campaign on larger shoppers. Already ordered clicks pass through directly. Short unordered lists use insertion sort, and longer lists use byte-wise stable radix sorting. All methods select the latest eligible click and break timestamp ties by the byte-wise smallest click ID. Event-ID deduplication still chooses the earliest ingestion before a shopper receives the winning event.
+
+The same Arm Linux executable selected all three methods at runtime. Six interleaved fresh OCI containers per method ran on an M4 Max with eight vCPUs. Inputs and outputs were on Linux tmpfs with file data already resident. The VM had 12 GiB and zero swap. Each container ran as UID 1000 with a read-only root and data, an isolated network namespace and a 64 MiB temporary filesystem. Timing starts before launching `crun` and ends when it exits. The standalone Linux binaries used GCC 14.2, musl and native Arm code generation. The official Xeon submission uses the Debian x86-64 build in the Dockerfile.
+
+| Method | 20M events and 5M clicks, median | 60M events and 15M clicks, median |
+|---|---:|---:|
+| Existing release with half-hour bins and weekly ranges | 313.60 ms | 1,001.16 ms |
+| Same release with per-shopper event sorting | 354.06 ms | 1,095.45 ms |
+| Experimental binary, weekly ranges | 316.78 ms | 1,004.65 ms |
+| Experimental binary, masks through 64 sessions | 310.38 ms | 1,008.16 ms |
+| Experimental binary, masks and chronological frontier | 312.91 ms | 1,004.65 ms |
+
+The first release run in the completed 20M series is recorded separately in the raw results. The slowest of the six interleaved release runs was 320.99 ms at 20M and 1,113.20 ms at 60M. The largest input used seed 47191 and contained 5,642,203,940 bytes across 108 files. The practice input used seed 11971 and contained 1,877,554,817 bytes across 192 files. To keep generator memory bounded for the 60M run, the test generated batches of physical filenames, retaining the organizer's per-shard row generation and per-file shuffle. All 192 files of a practice dataset produced this way matched the unmodified generator byte-for-byte by SHA-256.
+
+The official comparator found zero differing rows and zero duplicate output keys across methods. The 20M comparison covered 2,237,708 user-days and 28,014 campaign-days. The 60M reference was the existing release on the new seed, with 6,645,833 user-days and 28,014 campaign-days. The mask and frontier paths also passed all 36 organizer fixtures, the published 1M development answer, and synthetic cases at 63, 64 and 65 sessions against the brute-force oracle. A profile-guided AVX-512 build passed the organizer fixtures and development answer under Linux CPU emulation.
+
+The production pipeline fuses grouping, session formation and attribution. A separate diagnostic inserts barriers and saves each shopper's sessions and rank index between stages. Medians below come from four fresh diagnostic containers using weekly ranges. Saving and restoring those intermediates costs time. The production fused stage took 115.55 ms at 20M and 375.22 ms at 60M.
+
+| Diagnostic stage | 20M elapsed | 60M elapsed |
+|---|---:|---:|
+| Open and parse CSVs and build identity links | 139.55 ms | 460.2 ms |
+| Deduplicate and repartition | 42.73 ms | 162.5 ms |
+| Group shoppers and join aliases | 73.06 ms | 211.4 ms |
+| Form sessions and save their summaries | 57.81 ms | 182.1 ms |
+| Restore the summaries and attribute campaigns | 29.52 ms | 103.7 ms |
+| Write both Parquet tables | 5.39 ms | 16.5 ms |
+
+The CSV includes individual container times, major and minor page faults, peak RSS and timer boundaries. The sort and stage controls are small source patches. Apply each to a separate checkout of this branch and build with `make`. Set `SHOP_ASSISTS=week` for either control. Supply a generated input directory and a fresh output directory as the two arguments to `./pipeline`. Set `NCPU=8 PROFILE=1` for the stage timers. [Raw measurements](scripts/benchmarks/session-positions.csv) · [Sorting control](scripts/benchmarks/sort-control.patch) · [Stage diagnostic](scripts/benchmarks/stage-boundaries.patch)

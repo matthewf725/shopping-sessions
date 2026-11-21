@@ -194,6 +194,21 @@ def adversarial(data, years):
                               ('c_01', [-WEEK+hour, WEEK, WEEK+hour])]:
         for i, offset in enumerate(offsets):
             clicks.append((f'seam-{campaign}-{i}', 'seams', campaign, str(base + offset)))
+    # Session 64 occupies the high bit. Session 65 uses the chronological campaign frontier.
+    for count in (1, 63, 64, 65):
+        person = f'positions-{count}'
+        starts = [base + j * 3 * hour for j in range(count)]
+        for j, t in enumerate(starts):
+            events.append((f'{person}-e{j}', person, str(t), iso(t), 'purchase',
+                           'p1' if j % 2 else 'p2', str(1 + j)))
+        for j, (t, campaign) in enumerate((
+                (starts[0] - WEEK, 'c_1'), (starts[-1] - WEEK - 1, 'c_2'),
+                (starts[-1] - WEEK, 'c_01'), (starts[-1], 'c_01'),
+                (starts[-1] + 1, 'c_2'), (starts[0], 'c_1'))):
+            clicks.append((f'{person}-k{j}', person, campaign, str(t)))
+            clicks.append(clicks[-1])
+        clicks.extend([('k-z-tie', person, 'c_2', str(starts[-1])),
+                       ('k-a-tie', person, 'c_1', str(starts[-1]))])
     data_sets = {'events': ('event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents', events),
                  'clicks': ('click_id,user_id,campaign_id,ts', clicks), 'links': ('user_id_a,user_id_b', links)}
     for name, (header, rows) in data_sets.items():

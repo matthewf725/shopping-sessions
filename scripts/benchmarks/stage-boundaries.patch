@@ -1,0 +1,110 @@
+--- a/src/sessions.hpp
++++ b/src/sessions.hpp
+@@ -478,7 +478,16 @@
+             start_rank_.resize(occupied_.size());
+         }
+     }
+-    void run(Key person, const Segment* chain, std::vector<UserDay>& users, CampaignDays& campaigns) {
++    struct Saved {
++        std::vector<Session> sessions;
++        std::vector<SessionDay> days;
++        std::vector<uint64_t> bits;
++        std::vector<uint32_t> ranks;
++    };
++    struct Slice {
++        size_t sessions, count, days, day_count, index, first_word, word_count;
++    };
++    Slice form(Key person, const Segment* chain, std::vector<UserDay>& users, Saved& saved) {
+         sessions_.clear();
+         first_word_ = occupied_.size();
+         last_word_ = 0;
+@@ -487,8 +496,28 @@
+             collect(seg->events, seg->n);
+             has_events = true;
+         }
+-        if (!has_events) return;
++        if (!has_events) return {};
+         form_sessions(person, users);
++        size_t words = indexed_ ? last_word_ - first_word_ + 1 : 0;
++        Slice span{saved.sessions.size(), sessions_.size(), saved.days.size(), session_days_.size(),
++                   saved.bits.size(), first_word_, words};
++        saved.sessions.insert(saved.sessions.end(), sessions_.begin(), sessions_.end());
++        saved.days.insert(saved.days.end(), session_days_.begin(), session_days_.end());
++        if (words) {
++            saved.bits.insert(saved.bits.end(), start_bits_.begin()+first_word_, start_bits_.begin()+last_word_+1);
++            saved.ranks.insert(saved.ranks.end(), start_rank_.begin()+first_word_, start_rank_.begin()+last_word_+1);
++        }
++        return span;
++    }
++    void attribute_saved(const Segment* chain, const Saved& saved, const Slice& span, CampaignDays& campaigns) {
++        if (!span.count) return;
++        sessions_.assign(saved.sessions.begin()+span.sessions, saved.sessions.begin()+span.sessions+span.count);
++        session_days_.assign(saved.days.begin()+span.days, saved.days.begin()+span.days+span.day_count);
++        indexed_ = span.word_count != 0;
++        if (indexed_) {
++            std::copy_n(saved.bits.begin()+span.index, span.word_count, start_bits_.begin()+span.first_word);
++            std::copy_n(saved.ranks.begin()+span.index, span.word_count, start_rank_.begin()+span.first_word);
++        }
+         attribute(chain, campaigns);
+     }
+ };
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -104,6 +104,15 @@
+     Keys events{'e'}, users{'u'}, click_keys{'k'};
+     People people;
+     std::vector<Worker> workers;
++    struct PersonSegments {
++        Key name;
++        Segment local;
++        const Segment* aliases;
++        Shopper::Slice span{};
++        const Segment* chain() const { return aliases ? aliases : &local; }
++    };
++    std::array<std::vector<PersonSegments>, partitions> pending;
++    std::array<Shopper::Saved, partitions> formed;
+     Pipeline(const fs::path& data, size_t n) : window(data / "manifest.json"), dim(data) {
+         workers.reserve(n);
+         for (size_t i = 0; i < n; ++i) workers.emplace_back(uint32_t(i), window, dim, click_keys);
+@@ -470,7 +479,7 @@
+             if (canonical)
+                 dst.segments[partition(canonical)].push_back(seg);
+             else
+-                dst.shopper.run(g.key, &seg, dst.days, dst.campaigns);
++                pending[p].push_back({g.key, seg, nullptr});
+             e0 = g.events;
+             c0 = g.clicks;
+         }
+@@ -483,8 +492,9 @@
+             auto [head, fresh] = groups.add(seg.name, &seg);
+             if (!fresh) { seg.next = head; head = &seg; }
+         }
+-        for (auto& slot : groups.slots()) if (slot.key) dst.shopper.run(slot.key, slot.value, dst.days, dst.campaigns);
+-        for (auto& w : workers) std::vector<Segment>().swap(w.segments[p]);
++        for (auto& slot : groups.slots())
++            if (slot.key) pending[p].push_back({slot.key, {}, slot.value});
++
+     }
+     void run(const fs::path& data, const fs::path& output, Profile& profile) {
+         read(data); profile.mark("parse and link");
+@@ -494,7 +504,19 @@
+         profile.mark("deduplicate and partition");
+         parallel(workers.size(), partitions, [&](size_t wi, size_t p) { group_aliases(p, workers[wi]); });
+         parallel(workers.size(), partitions, [&](size_t wi, size_t p) { join_aliases(p, workers[wi]); });
+-        profile.mark("sessions and attribution");
++        profile.mark("group shoppers");
++        parallel(workers.size(), partitions, [&](size_t wi, size_t p) {
++            auto& dst = workers[wi];
++            for (auto& person : pending[p])
++                person.span = dst.shopper.form(person.name, person.chain(), dst.days, formed[p]);
++        });
++        profile.mark("form and save sessions");
++        parallel(workers.size(), partitions, [&](size_t wi, size_t p) {
++            auto& dst = workers[wi];
++            for (const auto& person : pending[p])
++                dst.shopper.attribute_saved(person.chain(), formed[p], person.span, dst.campaigns);
++        });
++        profile.mark("restore and attribute");
+         fs::create_directories(output / "user_daily");
+         fs::create_directories(output / "campaign_daily");
+         parallel(workers.size(), workers.size() + 1, [&](size_t, size_t part) {
