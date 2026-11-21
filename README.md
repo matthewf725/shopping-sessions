@@ -222,3 +222,19 @@ Two clean Debian GCC 12 release builds produced the same AVX-512 ELF with SHA-25
 On seed 11971 with eight pinned CPUs, nine interleaved runs for each translated Linux x86-64-v2 binary gave medians of 0.4242 s for the submitted C++ source, 0.4150 s for narrow C++ records and 0.4044 s for the Rust reference. The Rust build used its original source, locked dependencies and release profile with the same portable CPU target. All 27 pairs of output tables matched. The author's Dockerfile defaults to x86-64-v3. [Pinned Rust source and Dockerfile](https://github.com/cherylaurelia/builders-hackathon/tree/e185a97fa39841175c75fbcbb1d6ac885289f09d) · [Per-process timing, stage boundaries and executable hashes](scripts/benchmarks/pinned-rust-comparison.csv)
 
 On the same seed, changing only the eight-worker C++ process's Arm CPU affinity from eight CPUs to four moved its median from 0.2575 s to 0.4830 s. Four workers on four CPUs took 0.4541 s. Each result includes five fresh containers and full output checks. The official scorer assigns eight Xeon hardware threads. [Official container limits](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions)
+
+### How input file state changes the local 20M time
+
+On an M4 Max, the same eight-worker macOS executable read the same 1,877,554,817 input bytes and wrote the same two tables on every run. We touched one byte of every page of the original input through a memory mapping. For each trial, we gave the process a directory of links to those files or to fresh copies with identical contents. Copies retained the source files' HFS+ compression. We checked every copied file's SHA-256 after timing and compared every result to an independent reference covering 2,237,708 user-day rows and 28,014 campaign-day rows.
+
+| Input bytes served by fresh copies | First whole process, trial 1 | First whole process, trial 2 |
+| --- | ---: | ---: |
+| 0% | 0.3368 s | 0.2564 s |
+| 55% | 0.5587 s | 0.5227 s |
+| 100% | 0.8293 s | 0.8289 s |
+
+With entirely fresh copies, reading and linking took 670 and 679 ms. Kernel CPU time across the workers was 2.72 and 2.69 s. After two runs on the first set of copies, touching every file page through a mapping raised observed residency from 18,960 to 114,689 pages. The next whole process took 0.2856 s, with 150 ms in reading and linking and 0.31 s of kernel CPU time. In the other trial, a separate buffered read followed by the same executable took 0.6337 s for the executable. The measurements exclude the separate preparation step. The scored program performs all its own input reads.
+
+A second control used six fresh compressed copies and six fresh uncompressed copies of the same 2M dataset. The first process on each compressed copy took 0.0730–0.0754 s, against 0.0358–0.0380 s on each uncompressed copy. All 48 outputs matched. Builders publishes whole-container times and withholds hidden stage and page-cache measurements. [All 66 process measurements](scripts/benchmarks/input-cache-state.csv) · [Official scorer](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions)
+
+Three paired Linux x86 simulation trials on public practice seed 719 compared the exact 0.87 s Xeon release with the compact-record release. Median simulated ticks were 1.524 billion and 1.534 billion respectively. The compact release won the first pair. The scored release won the other two. All six runs matched every output row and column. [Per-run instruction counts, ticks and executable hashes](scripts/benchmarks/xeon-seed719-comparison.csv)
