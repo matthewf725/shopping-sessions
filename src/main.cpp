@@ -8,6 +8,7 @@
 #include <functional>
 #include <iostream>
 #include <thread>
+#include <sys/resource.h>
 
 namespace shop {
 constexpr unsigned partition_bits = 8;
@@ -192,6 +193,13 @@ struct Pipeline {
         read_rows<4>(chunk, consume);
 #endif
     }
+    static long input_blocks() {
+#if defined(__linux__)
+        struct rusage usage{};
+        if (getrusage(RUSAGE_THREAD, &usage) == 0) return usage.ru_inblock;
+#endif
+        return 0;
+    }
     void read(const fs::path& data) {
         CsvPieces ev(data / "events"), ck(data / "clicks");
         CsvFiles links(data / "links");
@@ -217,12 +225,43 @@ struct Pipeline {
         for (auto &w : workers) {
             preallocate(w.details, per_worker / 1600);
         }
-        size_t click_start = 1 + ev.chunks.size();
-        parallel(workers.size(), click_start + ck.chunks.size(), [&](size_t wi, size_t job) {
-            if (job == 0) people.build(links, users);
-            else if (job < click_start) parse_events(inputs[wi].read(ev.chunks[job - 1]), workers[wi]);
-            else parse_clicks(inputs[wi].read(ck.chunks[job - click_start]), workers[wi]);
+        const size_t click_start = 1 + ev.chunks.size();
+        const size_t jobs = click_start + ck.chunks.size();
+        std::atomic<size_t> next{0};
+        std::atomic<bool> reading_blocks{false};
+        parallel(workers.size(), workers.size(), [&](size_t wi, size_t) {
+            auto& input = inputs[wi];
+            auto& worker = workers[wi];
+            // Sampling measures this thread's completed filesystem reads. On a storage miss,
+            // reserving consecutive chunks gives Linux a sequential stream for this descriptor.
+            unsigned pieces = 0;
+            for (;;) {
+                bool from_storage = reading_blocks.load(std::memory_order_relaxed);
+                size_t stride = from_storage ? 8 : 1;
+                size_t first = next.fetch_add(stride, std::memory_order_relaxed);
+                if (first >= jobs) break;
+                size_t stop = std::min(first + stride, jobs);
+                for (size_t j = first; j < stop; ++j) {
+                    if (j == 0) {
+                        people.build(links, users);
+                        continue;
+                    }
+                    bool event = j < click_start;
+                    const FilePiece& piece = event ? ev.chunks[j - 1] : ck.chunks[j - click_start];
+                    bool sample = !from_storage && ((pieces++ & 31) == 0);
+                    long before = sample ? input_blocks() : 0;
+                    Chunk chunk = input.read(piece);
+                    if (sample && input_blocks() > before) {
+                        reading_blocks.store(true, std::memory_order_relaxed);
+                        from_storage = true;
+                    }
+                    if (event) parse_events(chunk, worker);
+                    else parse_clicks(chunk, worker);
+                }
+            }
         });
+        if (std::getenv("PROFILE"))
+            std::fprintf(stderr, "input_block_io %d\n", int(reading_blocks.load()));
     }
     int64_t ingest_order(PackedEvent e) const {
         if (e.tag & detailed) return workers[e.tag ^ detailed].details[e.when].ingest_order;
