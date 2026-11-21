@@ -18,6 +18,8 @@ For the 14-day input window, each event takes expected constant work. The allowe
 
 For a native build, run `make ARROW_PREFIX=/path/to/arrow`. Run `./pipeline INPUT EMPTY_OUTPUT` with `NCPU` set to the desired thread count. Set `PROFILE=1` for stage timings on stderr. Run `python3 scripts/profile.py ./pipeline INPUT EMPTY_OUTPUT` to include process launch and exit. The parent and child use the same monotonic clock.
 
+On Apple silicon, the local Linux simulator executes the AVX-512 build, checks Parquet results and counts guest instructions. A separate LLVM model estimates Cascade Lake or Ice Lake throughput for a compiled loop. [Local simulation and calibration](scripts/xeon-sim/README.md)
+
 `python tests/differential.py ./pipeline --generator /path/to/generate` compares the pipeline with an independent chronological reference on six generated seeds and four crafted cases. They cover overlapping, touching and disjoint click windows, unusual IDs, both dense and sparse week storage, and records spanning multiple file chunks. The chunk-boundary case also forces a file-size error and retries in the same output directory.
 
 ## Measurements

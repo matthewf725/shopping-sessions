@@ -1,0 +1,25 @@
+--- a/iodev/unmapped.cc
++++ b/iodev/unmapped.cc
+@@ -28,0 +29,2 @@
++#include "cpu/cpu.h"
++#include "pc_system.h"
+@@ -179,0 +182,19 @@
++  // The benchmark wrapper brackets fork/exec/wait with two 32-bit port writes.
++  // get_icount() excludes the synthetic quantum credited to a halted vCPU.
++  if (address == 0xe9 && io_len == 4 && (value == 0x53484f31 || value == 0x53484f32)) {
++    static Bit64u start_instructions = 0, start_ticks = 0;
++    Bit64u sum = 0;
++    for (unsigned cpu = 0; cpu < BX_SMP_PROCESSORS; ++cpu)
++      sum += BX_CPU(cpu)->get_icount();
++    if (value == 0x53484f31) {
++      start_instructions = sum;
++      start_ticks = bx_pc_system.time_ticks();
++    } else {
++      fprintf(stderr, "SHOP_SIM_COUNTER instructions=%llu virtual_ticks=%llu\n",
++              (unsigned long long)(sum - start_instructions),
++              (unsigned long long)(bx_pc_system.time_ticks() - start_ticks));
++      fflush(stderr);
++    }
++    return;
++  }
++
