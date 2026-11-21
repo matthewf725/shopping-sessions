@@ -36,8 +36,8 @@ struct Worker {
     std::vector<Detail> details;
     ShardedBlocks<RawEvent, partitions> parsed;
     std::array<std::vector<Segment>, partitions> segments;
-    std::array<std::vector<OwnedEvent>, partitions> events;
-    std::array<std::vector<OwnedClick>, partitions> clicks;
+    ShardedBlocks<OwnedEvent, partitions> events;
+    ShardedBlocks<OwnedClick, partitions> clicks;
     std::vector<UserDay> days;
     CampaignDays campaigns;
     Shopper shopper;
@@ -103,8 +103,6 @@ struct Pipeline {
     Dimensions dim;
     Keys events{'e'}, users{'u'}, click_keys{'k'};
     People people;
-    struct RawStore { std::vector<Event> events; std::vector<Click> clicks; };
-    std::array<RawStore, partitions> stores;
     std::vector<Worker> workers;
     Pipeline(const fs::path& data, size_t n) : window(data / "manifest.json"), dim(data) {
         workers.reserve(n);
@@ -168,14 +166,15 @@ struct Pipeline {
             Time ts = window.clock.parse(f[3]);
             if (ts < window.start - week_ms || ts >= window.end) return;
             Key raw_user = users.encode(f[1]);
-            w.clicks[partition(raw_user)].push_back({raw_user, {ts, click_keys.encode(f[0]), campaign}});
+            w.clicks.append(partition(raw_user), {raw_user, {ts, click_keys.encode(f[0]), campaign}});
         };
 #if defined(__AVX512BW__) && defined(__AVX512DQ__) && defined(__AVX512VL__)
         auto accelerate = [&](const char* data, const uint32_t* offsets, const uint16_t* rows) {
             return ClickLanes::parse(window, dim.campaigns, data, offsets, rows,
-                [&](uint64_t hash, Key person, Key id, Time time, uint32_t campaign) {
-                    w.clicks[hash_partition(hash)].push_back({person, {time, id, campaign}});
-                });
+                                     [&](uint64_t hash, Key person, Key id, Time time, uint32_t campaign) {
+                                         w.clicks.append(hash_partition(hash),
+                                                         {person, {time, id, campaign}});
+                                     });
         };
         read_rows<4>(chunk, consume, BatchProjection{consume, accelerate});
 #else
@@ -184,9 +183,6 @@ struct Pipeline {
     }
     void read(const fs::path& data) {
         CsvFiles ev(data / "events"), ck(data / "clicks"), links(data / "links");
-        for (auto& w : workers) {
-            for (auto& v : w.clicks) v.reserve(ck.bytes / (48 * workers.size() * partitions));
-        }
         size_t click_start = 1 + ev.chunks.size();
         parallel(workers.size(), click_start + ck.chunks.size(), [&](size_t wi, size_t job) {
             if (job == 0) people.build(links, users);
@@ -257,7 +253,7 @@ struct Pipeline {
         FlatMap<RawEvent*, std::identity{}> best(size / 10);
         auto emit = [&](const RawEvent& row) {
             if (row.person) {
-                dst.events[partition(row.person)].push_back({row.person, row.event});
+                dst.events.append(partition(row.person), {row.person, row.event});
             }
         };
         auto repeat = [&](RawEvent& row) {
@@ -301,8 +297,8 @@ struct Pipeline {
         using Group = RawGroup;
         size_t ne = 0, nc = 0;
         for (auto& w : workers) {
-            ne += w.events[p].size();
-            nc += w.clicks[p].size();
+            ne += w.events.size(p);
+            nc += w.clicks.size(p);
         }
         if (!(ne || nc))
             return;
@@ -331,18 +327,22 @@ struct Pipeline {
             }
             return g;
         };
-        for (auto& w : workers)
-            for (auto& e : w.events[p]) {
-                auto* g = lookup(e.person);
-                ++g->events;
-                e.group = g;
-            }
-        for (auto& w : workers)
-            for (auto& c : w.clicks[p]) {
-                auto* g = lookup(c.person);
-                ++g->clicks;
-                c.group = g;
-            }
+        for (auto& w : workers) {
+            w.events.visit(p, [&](auto rows) {
+                for (auto& e : rows) {
+                    auto* g = lookup(e.person);
+                    ++g->events;
+                    e.group = g;
+                }
+            });
+            w.clicks.visit(p, [&](auto rows) {
+                for (auto& c : rows) {
+                    auto* g = lookup(c.person);
+                    ++g->clicks;
+                    c.group = g;
+                }
+            });
+        }
         size_t en = 0, cn = 0;
         for (auto* entry : used) {
             auto& g = *entry;
@@ -354,24 +354,24 @@ struct Pipeline {
         }
         // Scatter once by raw ID. These arrays stay in place through the canonical
         // shopper pass, so joining aliases moves only range descriptors.
-        auto& ev = stores[p].events;
-        auto& ck = stores[p].clicks;
-        ev.resize(en);
-        ck.resize(cn);
+        auto* ev = dst.parsed.allocate_range<Event>(en);
+        auto* ck = dst.parsed.allocate_range<Click>(cn);
         for (auto& w : workers) {
-            for (auto& e : w.events[p])
-                ev[e.group->events++] = unpack(e.value);
-            for (auto& c : w.clicks[p])
-                ck[c.group->clicks++] = c.value;
-            std::vector<OwnedEvent>().swap(w.events[p]);
-            std::vector<OwnedClick>().swap(w.clicks[p]);
+            w.events.visit(p, [&](auto rows) {
+                for (auto& e : rows)
+                    ev[e.group->events++] = unpack(e.value);
+            });
+            w.clicks.visit(p, [&](auto rows) {
+                for (auto& c : rows)
+                    ck[c.group->clicks++] = c.value;
+            });
         }
         size_t e0 = 0, c0 = 0;
         for (auto* entry : used) {
             auto& g = *entry;
             // A click-only alias may share a person with an event in another shard.
             Key canonical = people.linked_name(g.key);
-            Segment seg{g.events != e0 ? ev.data() + e0 : nullptr, g.clicks != c0 ? ck.data() + c0 : nullptr,
+            Segment seg{g.events != e0 ? &ev[e0] : nullptr, g.clicks != c0 ? &ck[c0] : nullptr,
                         uint32_t(g.events - e0), uint32_t(g.clicks - c0), canonical};
             if (canonical)
                 dst.segments[partition(canonical)].push_back(seg);
@@ -395,6 +395,8 @@ struct Pipeline {
     void run(const fs::path& data, const fs::path& output, Profile& profile) {
         read(data); profile.mark("parse and link");
         parallel(workers.size(), partitions, [&](size_t wi, size_t p) { dedup(p, workers[wi]); });
+        for (auto& w : workers)
+            w.parsed.recycle_pages();
         profile.mark("deduplicate and partition");
         parallel(workers.size(), partitions, [&](size_t wi, size_t p) { group_aliases(p, workers[wi]); });
         parallel(workers.size(), partitions, [&](size_t wi, size_t p) { join_aliases(p, workers[wi]); });

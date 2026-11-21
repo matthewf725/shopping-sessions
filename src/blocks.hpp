@@ -35,19 +35,29 @@ class ShardedBlocks {
     std::vector<std::unique_ptr<void, Free>> pages_;
     std::byte* pool_ = nullptr;
     size_t blocks_left_ = 0;
+    static constexpr size_t huge_page = 2 * 1024 * 1024;
+    static constexpr size_t page_bytes = 4 * huge_page;
+    struct Remaining {
+        std::byte* cursor;
+        size_t available;
+    };
+    std::vector<Remaining> recycled_;
+    void* new_page(size_t size) {
+        void* p = nullptr;
+        if (posix_memalign(&p, huge_page, size))
+            throw std::bad_alloc();
+        std::unique_ptr<void, Free> page(p);
+        pages_.push_back(std::move(page));
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+        madvise(p, size, MADV_HUGEPAGE);
+#endif
+        return p;
+    }
 
     [[gnu::noinline]] void extend(Cursor& c) {
         if (!blocks_left_) {
-            constexpr size_t huge_page = 2 * 1024 * 1024, bytes = 4 * huge_page;
-            void* p = nullptr;
-            if (posix_memalign(&p, huge_page, bytes)) throw std::bad_alloc();
-            std::unique_ptr<void, Free> page(p);
-            pages_.push_back(std::move(page));
-#if defined(__linux__) && defined(MADV_HUGEPAGE)
-            madvise(p, bytes, MADV_HUGEPAGE);
-#endif
-            pool_ = static_cast<std::byte*>(p);
-            blocks_left_ = bytes / sizeof(Block);
+            pool_ = static_cast<std::byte*>(new_page(page_bytes));
+            blocks_left_ = page_bytes / sizeof(Block);
         }
         Block* b = ::new (pool_) Block;
         pool_ += sizeof(Block);
@@ -64,6 +74,39 @@ class ShardedBlocks {
         c.limit = b->items + records;
     }
 public:
+  // Every deduplication worker has finished reading the parsed records.
+  // Their storage can now hold the contiguous event and click ranges.
+  void recycle_pages() {
+      pool_ = nullptr;
+      blocks_left_ = 0;
+      shards_ = {};
+      recycled_.reserve(pages_.size());
+      for (auto& page : pages_)
+          recycled_.push_back({static_cast<std::byte*>(page.get()), page_bytes});
+  }
+  template <class U> U* allocate_range(size_t n) {
+      static_assert(alignof(U) <= 64);
+      static_assert(std::is_trivially_default_constructible_v<U> && std::is_trivially_destructible_v<U>);
+      if (!n)
+          return nullptr;
+      if (n > (SIZE_MAX - 63) / sizeof(U))
+          throw std::bad_array_new_length();
+      size_t bytes = (n * sizeof(U) + 63) & ~size_t(63);
+      // Best fit keeps larger unused portions available for a later shard.
+      Remaining* best = nullptr;
+      for (auto& p : recycled_)
+          if (p.available >= bytes && (!best || p.available < best->available))
+              best = &p;
+      if (!best) {
+          size_t size = std::max(page_bytes, bytes);
+          recycled_.push_back({static_cast<std::byte*>(new_page(size)), size});
+          best = &recycled_.back();
+      }
+      auto* ptr = best->cursor;
+      best->cursor += bytes;
+      best->available -= bytes;
+      return ::new (ptr) U[n];
+  }
     void append(size_t shard, const T& row) {
         auto& c = shards_[shard];
         if (c.next == c.limit) extend(c);
