@@ -245,6 +245,17 @@ def chunk_boundaries(data):
             f.write(f'ekey{i},{user},{start},{start},purchase,p1,{i+1}\n')
         for i, clock in enumerate(('23:59:59', '24:00:00', '19:60:00', '00:00:60', '02;00:00', '00:0a:00')):
             f.write(f'eclock{i},u12345678,2025-01-01T{clock}Z,{start},purchase,p1,101\n')
+        # These IDs share their partition and low 16 hash bits. Each has its own earliest copy.
+        for eid, price in [('e0000003e', 31), ('e0000041f', 47)]:
+            f.write(f'{eid},ucollide0,1735689600123,2025-01-01T00:01:00Z,purchase,p1,999\n')
+            f.write(f'{eid},ucollide0,1735689600123,{start},purchase,p1,{price}\n')
+    with (data / 'clicks' / 'epochs.csv').open('w') as f:
+        f.write('click_id,user_id,campaign_id,ts\n')
+        epoch = '1735689600123'
+        f.write(f'kgood,ucollide0,c_1,{epoch}\n')
+        for i in range(13):
+            broken = epoch[:i] + ':' + epoch[i+1:]
+            f.write(f'kbad{i},ucollide0,c_1,{broken}\n')
 
 
 def check(exe, data, output):

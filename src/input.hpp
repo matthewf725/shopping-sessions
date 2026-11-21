@@ -446,6 +446,27 @@ inline uint32_t eight_digits(uint64_t ascii) {
 
 // Parse the common 13-digit epoch form without a serial multiply-by-ten chain.
 inline Time epoch13(const char* p) {
+#if defined(__SSSE3__) && defined(__SSE4_1__)
+    const auto zero = _mm_set1_epi8('0');
+    // Left-pad 13 decimal digits to 16. Every load stays inside the field.
+#if defined(__AVX512VL__) && defined(__AVX512BW__)
+    auto raw = _mm_maskz_loadu_epi8(0x1fff, p);
+    auto digits = _mm_slli_si128(_mm_sub_epi8(raw, zero), 3);
+#else
+    auto head = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(p));
+    auto tail = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(p + 5));
+    auto raw = _mm_unpacklo_epi64(head, tail);
+    auto digits = _mm_shuffle_epi8(_mm_sub_epi8(raw, zero),
+        _mm_setr_epi8(-1,-1,-1,0,1,2,3,4,8,9,10,11,12,13,14,15));
+#endif
+    auto invalid = _mm_subs_epu8(digits, _mm_set1_epi8(9));
+    if (!_mm_testz_si128(invalid, invalid)) return invalid_time;
+    auto pairs = _mm_maddubs_epi16(digits, _mm_set1_epi16(0x010a));  // [10, 1]
+    auto fours = _mm_madd_epi16(pairs, _mm_set1_epi32(0x00010064));   // [100, 1]
+    auto groups = _mm_packs_epi32(fours, fours);
+    auto eights = _mm_madd_epi16(groups, _mm_set1_epi32(0x00012710)); // [10000, 1]
+    return Time(_mm_cvtsi128_si32(eights)) * 100'000'000 + _mm_extract_epi32(eights, 1);
+#else
     uint64_t head, tail;
     memcpy(&head, p, 8);
     memcpy(&tail, p + 5, 8);
@@ -458,6 +479,7 @@ inline Time epoch13(const char* p) {
     constexpr uint64_t high = 0x8080808080808080ULL;
     if (((head - zero) | (head + upper) | (tail - zero) | (tail + upper)) & high) return invalid_time;
     return Time(eight_digits(head)) * 100000 + (p[8] - '0') * 10000 + pair_value(p+9) * 100 + pair_value(p+11);
+#endif
 }
 
 class Clock {

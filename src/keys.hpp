@@ -65,7 +65,7 @@ public:
     }
 };
 
-template<class T>
+template<class T, auto bucket_hash = hash_key>
 class FlatMap {
 public:
     struct Slot { Key key{}; T value{}; };
@@ -74,7 +74,7 @@ private:
     size_t used_ = 0;
     size_t index(Key key) const {
         size_t mask = slots_.size() - 1;
-        size_t pos = hash_key(key) & mask;
+        size_t pos = bucket_hash(key) & mask;
         while (slots_[pos].key && slots_[pos].key != key) pos = (pos + 1) & mask;
         return pos;
     }

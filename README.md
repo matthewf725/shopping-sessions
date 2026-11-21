@@ -100,6 +100,14 @@ On the final-size input, the session stage took 8.66 ms longer in the first batc
 
 On seed 211 the translated x86-64-v2 fallback under Rosetta took 720.94 ms before and 720.36 ms after across nine interleaved runs per build. Its output matched the baseline. The native Xeon AVX-512 time for this change is unmeasured.
 
+### Xeon timestamp decoding and deduplication
+
+The Intel decoder evaluates 13-digit epoch timestamps in pairs and then groups of four and eight digits. The AVX-512 build loads exactly 13 bytes, so the field can end at a page boundary. Events with a known five-digit prefix retain the existing eight-digit path.
+
+Event partitioning stores the full 64-bit hash in each record. The hash is a permutation, so distinct event IDs stay distinct. Two bits per slot record the first and subsequent observations in one word. Candidates sharing a slot go to the exact table, which retains the earliest ingestion for each full key.
+
+Against `10198d3`, the x86-64-v2 fallback under Rosetta reduced median deduplication and repartitioning from 45.71 to 40.95 ms on practice seed 719 and from 42.54 to 38.53 ms on seed 211. Median launch-to-exit times moved from 755.11 to 747.25 ms and from 723.99 to 718.98 ms respectively. Each build ran 10 times on seed 719 and eight times on seed 211, with the builds interleaved, eight workers and RAM-backed files.
+
 ### Queries on CSV row patterns
 
 The standalone `scripts/shape_index.cpp` indexes the ID-width and UTC-date conditions above. One pass in filename order numbers the physical data rows from zero. For each 64 rows it stores a 64-bit exception mask and the number of exceptions before that word. Two prefix counts give the exact number of exceptions in any half-open range in `O(1)`. Count and selection queries store 16 bytes of directory entries per 64 rows plus one sentinel.

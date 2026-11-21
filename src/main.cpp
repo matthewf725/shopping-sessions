@@ -2,6 +2,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <ctime>
+#include <functional>
 #include <iostream>
 #include <thread>
 
@@ -13,7 +14,7 @@ inline size_t partition(Key key) { return hash_key(key) >> 56; }
 constexpr uint32_t detailed = 0x80000000u;
 struct PackedEvent { uint32_t when, tag; };
 struct Detail { int64_t ingest_order; Event event; };
-struct RawEvent { Key id, person; PackedEvent event; };
+struct RawEvent { Key id_hash, person; PackedEvent event; };
 static_assert(sizeof(RawEvent) == 24);
 template<class T> struct Owned { Key person; T value; };
 using OwnedEvent = Owned<PackedEvent>;
@@ -106,7 +107,10 @@ struct Pipeline {
             event = {uint32_t(w.details.size()), detailed | w.number};
             w.details.push_back({order, {ts, price, category}});
         }
-        w.parsed[partition(id)].push_back({id, person, event});
+        // Both xor-shifts and multiplication by an odd number are invertible
+        // on 64 bits. This hash is an exact event ID, and zero stays reserved.
+        Key id_hash = hash_key(id);
+        w.parsed[id_hash >> 56].push_back({id_hash, person, event});
     }
     void parse_events(Chunk chunk, Worker& w) {
         auto consume = [&](Text eid, Text person, Text time, Text ingest, Text kind, bool has_product, auto purchase) {
@@ -173,30 +177,31 @@ struct Pipeline {
         if (!size) return;
         // A hash collision only selects a key for an exact comparison. A lone bit
         // can bypass the full table. Both passes read the same contiguous shard.
-        struct Word { uint64_t seen = 0, repeated = 0; };
-        size_t words = std::bit_ceil(std::max<size_t>(1, (size + 3) / 4));
-        std::vector<Word> filter(words);
-        const size_t mask = words * 64 - 1;
+        // A pair of adjacent bits in one machine word records seen/repeated:
+        // 00 -> 01 -> 11. One read-modify-write updates both flags.
+        size_t words = std::bit_ceil((size + 1) / 2);
+        std::vector<uint64_t> filter(words);
+        const size_t slot_mask = words * 32 - 1;
         for (auto& w : workers) for (const auto& row : w.parsed[p]) {
-            size_t h = hash_key(row.id) & mask;
-            uint64_t bit = uint64_t(1) << (h & 63);
-            auto& word = filter[h >> 6];
-            word.repeated |= word.seen & bit;
-            word.seen |= bit;
+            size_t slot = row.id_hash & slot_mask;
+            uint64_t seen = uint64_t(1) << (2 * (slot & 31));
+            auto& word = filter[slot >> 5];
+            word |= seen | ((word & seen) << 1);
         }
-        FlatMap<RawEvent*> best(size / 10);
+        FlatMap<RawEvent*, std::identity{}> best(size / 10);
         auto emit = [&](const RawEvent& row) {
             if (row.person) {
                 dst.events[partition(row.person)].push_back({row.person, row.event});
             }
         };
         for (auto& w : workers) for (auto& row : w.parsed[p]) {
-            size_t h = hash_key(row.id) & mask;
-            if (!(filter[h >> 6].repeated & (uint64_t(1) << (h & 63)))) {
+            size_t slot = row.id_hash & slot_mask;
+            uint64_t repeated = uint64_t(2) << (2 * (slot & 31));
+            if (!(filter[slot >> 5] & repeated)) {
                 emit(row);
                 continue;
             }
-            auto [prev, fresh] = best.add(row.id, &row);
+            auto [prev, fresh] = best.add(row.id_hash, &row);
             if (!fresh && ingest_order(row.event) < ingest_order(prev->event)) prev = &row;
         }
         for (const auto& slot : best.slots()) if (slot.key) emit(*slot.value);
