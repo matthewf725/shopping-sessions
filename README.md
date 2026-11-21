@@ -127,3 +127,18 @@ To select the zero-based `k`th exception, the range's exact density predicts a r
 Seed 211 had 21,434,677 physical rows and 3,244,877 exceptions. The index returned identical answers to the explicitly stored exception list for 20,006 counts and 20,010 selections. The millionth exception was at row 6,604,305, 21 words from its predicted location. Across the sampled nonempty ranges the median error was 21 words and the 99th percentile was 100 words.
 
 Build with `c++ -O3 -march=native -std=c++20 -Isrc scripts/shape_index.cpp -o /tmp/shape-index`. Run `/tmp/shape-index DATA` and enter `first stop` to count exceptions. With `--select`, enter `first stop k` to get the physical row number or `none`. With `--list`, enter `first stop` to print the original row, filename and byte-offset listing. Run `python3 tests/shape_index.py /tmp/shape-index` to check shuffled and clustered layouts. The timed pipeline reads its own fresh CSV input directly.
+
+### Campaign coverage on shoppers with many clicks
+
+This branch keeps the half-hour session summaries. When a shopper has at least nine sessions and at least `max(1024, 8 × sessions)` clicks in a dense window, it also folds last-click candidates into half-hour bins. Each bin keeps the latest click and, when it contains a session start, the best click on either side of that start. Weekly ranges per campaign retain all assists. The chooser sees the actual shopper’s records during execution.
+
+Build the isolated comparison and supply a generated practice input directory.
+
+```sh
+c++ -O3 -DNDEBUG -std=c++20 -pthread -Isrc scripts/bench-attribution.cpp -o /tmp/bench-attribution
+/tmp/bench-attribution /path/to/input
+```
+
+The comparison checks each campaign-day against exhaustive click enumeration before timing. It exercises the original weekly ranges, chronological sorting and interval merging, and the bin method. A native M4 Max run with 300 sessions and 32,768 shuffled clicks took about 84 µs per shopper for the bin method and 189 µs for weekly ranges. These timings start with one shopper’s events already grouped. On 20M events and 5M clicks, seed 11971, only nine shoppers qualified. Eleven paired native macOS runs gave start-to-exit medians of 343.6 ms for weekly ranges and 343.1 ms with the chooser enabled. The two methods produced identical daily tables. This branch has no official Xeon timing.
+
+The chronological control draws on the parallel interval join described by Bouros and Mamoulis. [Forward-scan interval join paper](https://www.vldb.org/pvldb/vol10/p1346-bouros.pdf)

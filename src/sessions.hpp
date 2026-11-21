@@ -87,6 +87,9 @@ inline void radix_cells(std::vector<uint32_t>& cells, std::vector<uint32_t>& scr
 }
 
 class Shopper {
+#ifdef SHOP_BENCH_ATTRIBUTION
+    friend struct AttributionTrial;
+#endif
     struct Bucket { Time first, last; uint32_t events, purchases; };
     struct Purchase { uint32_t price, category, next; };
     struct Session { Time start; int64_t revenue; Click credit; int32_t day; uint32_t day_index; };
@@ -275,7 +278,19 @@ class Shopper {
         if ((word & bit) && (inclusive ? sessions_[n].start <= t : sessions_[n].start < t)) ++n;
         return n;
     }
-    void attribute(const Segment* chain, CampaignDays& campaigns) {
+    void credit_sessions(CampaignDays& campaigns) {
+        Click latest{invalid_time, 0, 0};
+        for (const auto& s : sessions_) {
+            if (s.credit.id) latest = s.credit;
+            uint32_t credited = latest.ts >= s.start - week_ms ? latest.campaign : 0;
+            auto& t = campaigns.credited(credited, s.day);
+            ++t.sessions;
+            t.purchasing += (s.revenue > 0);
+            t.revenue += s.revenue;
+        }
+    }
+
+    void rank_assists(const Segment* chain, CampaignDays& campaigns) {
         for (auto seg = chain; seg; seg = seg->next) for (uint32_t i = 0; i < seg->m; ++i) {
             const Click& c = seg->clicks[i];
             size_t first = rank(c.ts, false);
@@ -309,16 +324,105 @@ class Shopper {
             assists(at, range, next == sparse_coverage_.end() ? SIZE_MAX : next->second.first_session);
         }
         sparse_coverage_.clear();
-        Click latest{invalid_time, 0, 0};
-        for (const auto& s : sessions_) {
-            if (s.credit.id) latest = s.credit;
-            uint32_t credited = latest.ts >= s.start - week_ms ? latest.campaign : 0;
-            auto& t = campaigns.credited(credited, s.day);
-            ++t.sessions;
-            t.purchasing += (s.revenue > 0);
-            t.revenue += s.revenue;
-        }
+        credit_sessions(campaigns);
     }
+    struct ClickBin {
+        uint32_t first_session = UINT32_MAX;
+        Time first_start;
+        Click before_start, after_start;
+    };
+    struct ClickInterval {
+        Time first = INT64_MAX;
+        Time last = invalid_time;
+    };
+    std::vector<ClickBin> click_bins_;
+    std::vector<uint32_t> used_click_bins_;
+    std::vector<ClickInterval> intervals_;
+    std::vector<size_t> used_intervals_;
+
+    void keep_latest(Click& previous, const Click& c) const {
+        if (c.ts > previous.ts || (c.ts == previous.ts && click_keys_.less(c.id, previous.id)))
+            previous = c;
+    }
+
+    void fold_clicks(const Segment* chain, CampaignDays& campaigns) {
+        const Time base = origin_ - week_ms;
+        const Time earliest = sessions_.front().start - week_ms;
+        const Time latest = sessions_.back().start;
+        if (click_bins_.empty()) click_bins_.resize(bins_.size() + size_t(week_ms / gap));
+        if (intervals_.empty()) intervals_.resize(coverage_.size());
+
+        for (auto* seg = chain; seg; seg = seg->next) {
+            for (uint32_t j = 0; j < seg->m; ++j) {
+                const Click& c = seg->clicks[j];
+                if (c.ts < earliest || c.ts > latest) continue;
+                const size_t delta = size_t(c.ts - base);
+                const size_t bin = delta / gap;
+                auto& entry = click_bins_[bin];
+                if (entry.first_session == UINT32_MAX) {
+                    const size_t first = rank(base + Time(bin) * gap, false);
+                    entry.first_session = uint32_t(first);
+                    entry.first_start = first < sessions_.size() ? sessions_[first].start : INT64_MAX;
+                    entry.before_start = entry.after_start = {invalid_time, 0, 0};
+                    used_click_bins_.push_back(uint32_t(bin));
+                }
+                // A half-hour bin contains at most one session start. All its
+                // clicks therefore have one of two possible first eligible starts.
+                keep_latest(c.ts <= entry.first_start ? entry.before_start : entry.after_start, c);
+
+                // Equal-length windows from clicks in the same week overlap.
+                // Their union is determined by the earliest and latest click.
+                const size_t key = (delta / week_ms) * campaign_count_ + c.campaign;
+                auto& interval = intervals_[key];
+                if (interval.first == INT64_MAX) used_intervals_.push_back(key);
+                interval.first = std::min(interval.first, c.ts);
+                interval.last = std::max(interval.last, c.ts);
+            }
+        }
+
+        auto offer = [&](size_t first, const Click& c) {
+            if (c.id && first < sessions_.size() && sessions_[first].start - c.ts <= week_ms)
+                keep_latest(sessions_[first].credit, c);
+        };
+        for (uint32_t bin : used_click_bins_) {
+            auto& entry = click_bins_[bin];
+            offer(entry.first_session, entry.before_start);
+            offer(size_t(entry.first_session) + 1, entry.after_start);
+            entry.first_session = UINT32_MAX;
+        }
+        used_click_bins_.clear();
+
+        for (size_t key : used_intervals_) {
+            const auto& interval = intervals_[key];
+            const size_t first = rank(interval.first, false);
+            const size_t next = key + campaign_count_;
+            const Time end = interval.last + week_ms;
+            // Assign shared endpoints to the next week's interval exactly once.
+            const size_t stop = next < intervals_.size() && intervals_[next].first <= end
+                ? rank(intervals_[next].first, false) : rank(end, true);
+            if (first < stop) {
+                const auto* day = session_days_.data() + sessions_[first].day_index;
+                campaigns.add_assists(uint32_t(key % campaign_count_), day, first, stop);
+            }
+        }
+        for (size_t key : used_intervals_) intervals_[key] = {};
+        used_intervals_.clear();
+        credit_sessions(campaigns);
+    }
+
+    void attribute(const Segment* chain, CampaignDays& campaigns) {
+        // Build the additional index only for shoppers with many clicks per session.
+        if (!bins_.empty() && !coverage_.empty() && sessions_.size() >= 9) {
+            size_t count = 0;
+            for (const auto* seg = chain; seg; seg = seg->next) count += seg->m;
+            if (count >= std::max<size_t>(1024, 8 * sessions_.size())) {
+                fold_clicks(chain, campaigns);
+                return;
+            }
+        }
+        rank_assists(chain, campaigns);
+    }
+
 public:
     Shopper(const Window& w, const Dimensions& d, const Keys& click_keys)
         : origin_(w.start), click_keys_(click_keys), category_sums_(d.categories.size()+1), campaign_count_(d.names.size()) {
