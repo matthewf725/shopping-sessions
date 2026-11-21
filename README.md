@@ -26,9 +26,9 @@ On Apple silicon, the local Linux simulator executes the AVX-512 build, checks P
 
 ## Measurements
 
-Team Uhhh scored **1.12 s** on the official Xeon practice run for commit `1018e64` (receipt `BB-74417B0D`). Its previous submission, `ef41f89`, scored 1.52 s. [Builders leaderboard](https://www.joinbuilders.org/buildathon/leaderboard)
+Team Uhhh scored **0.93 s** on the official Xeon practice run for commit `d744498` (receipt `BB-0AFCC483`). The two previous scores were 1.12 s for `1018e64` and 1.52 s for `ef41f89`. [Builders leaderboard](https://www.joinbuilders.org/buildathon/leaderboard)
 
-The Xeon build that batches shard writes and uses half-hour cells matched both reference tables on two 20M-event, 5M-click inputs. Its three fresh-process runs per seed retired a median of 12.52 billion instructions on seed 719 and 12.41 billion on seed 11971. Median simulated ticks were 1.727 billion and 1.707 billion. Scaling each run against the 1.12 s submission on the same input gives 0.485–0.497 s and 0.469–0.476 s respectively. Only the Builders scorer measures native container time.
+The Xeon build that batches shard writes and uses half-hour cells matched both reference tables on two 20M-event, 5M-click inputs. Its three fresh-process runs per seed retired a median of 12.52 billion instructions on seed 719 and 12.41 billion on seed 11971. Median simulated ticks were 1.727 billion and 1.707 billion. Scaling each run against the 1.12 s submission on the same input gives 0.485–0.497 s and 0.469–0.476 s respectively. The official 0.93 s result was about 1.9 times the median estimate. These instruction-based ratios overstated the native speedup.
 
 On two fresh practice-size inputs the Linux AVX-512 simulator ran the scored binary, the new CSV and deduplication paths, and a profile-guided build. The profile-guided binary retired 16.81 billion guest instructions on seed 719 and 16.69 billion on seed 11971. The scored binary retired 28.91 billion and 29.52 billion respectively. Both tables matched on both inputs, including 2,251,704 and 2,237,708 user-day rows. These counts include Linux kernel work. The measured native Xeon score above belongs to the original binary.
 
