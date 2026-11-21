@@ -14,13 +14,26 @@ using Logical = pq::ConvertedType;
 static Node column(const char* name, Type::type type, Logical::type logical = Logical::NONE, bool nullable = false) {
     return pq::schema::PrimitiveNode::Make(name, nullable ? pq::Repetition::OPTIONAL : pq::Repetition::REQUIRED, type, logical);
 }
-static auto writer(const fs::path& path, const std::vector<Node>& fields) {
+struct OutputFile {
+    std::shared_ptr<arrow::io::FileOutputStream> stream;
+    std::unique_ptr<pq::ParquetFileWriter> parquet;
+
+    void close() {
+        parquet->Close();
+        if (!stream->closed()) {
+            auto status = stream->Close();
+            if (!status.ok()) throw std::runtime_error(status.ToString());
+        }
+    }
+};
+
+static OutputFile writer(const fs::path& path, const std::vector<Node>& fields) {
     auto result = arrow::io::FileOutputStream::Open(path.string());
     if (!result.ok()) throw std::runtime_error(result.status().ToString());
     auto schema = std::static_pointer_cast<pq::schema::GroupNode>(
         pq::schema::GroupNode::Make("data", pq::Repetition::REQUIRED, fields));
     auto props = pq::WriterProperties::Builder().disable_dictionary()->disable_statistics()->build();
-    return pq::ParquetFileWriter::Open(*result, schema, props);
+    return {*result, pq::ParquetFileWriter::Open(*result, schema, props)};
 }
 
 template<class Writer, class T>
@@ -55,7 +68,7 @@ void write_users(const fs::path& path, const std::vector<UserDay>& rows, const K
             present[j] = row.top != 0;
             if (row.top) cats.push_back(bytes(d.categories[row.top - 1]));
         }
-        auto* group = file->AppendRowGroup();
+        auto* group = file.parquet->AppendRowGroup();
         batch<pq::ByteArrayWriter>(group, ids);
         batch<pq::Int32Writer>(group, days);
         batch<pq::Int32Writer>(group, sessions);
@@ -64,7 +77,7 @@ void write_users(const fs::path& path, const std::vector<UserDay>& rows, const K
         static_cast<pq::ByteArrayWriter*>(group->NextColumn())->WriteBatch(n, present.data(), nullptr, cats.data());
         group->Close();
     }
-    file->Close();
+    file.close();
 }
 void write_campaigns(const fs::path& path, const CampaignDays& totals, const Dimensions& d) {
     auto file = writer(path, {column("campaign_id", Type::BYTE_ARRAY, Logical::UTF8), column("channel", Type::BYTE_ARRAY, Logical::UTF8),
@@ -83,7 +96,7 @@ void write_campaigns(const fs::path& path, const CampaignDays& totals, const Dim
         assists.push_back(t.assists);
     });
     if (!days.empty()) {
-        auto* group = file->AppendRowGroup();
+        auto* group = file.parquet->AppendRowGroup();
         batch<pq::ByteArrayWriter>(group, ids);
         batch<pq::ByteArrayWriter>(group, channels);
         batch<pq::Int32Writer>(group, days);
@@ -93,6 +106,6 @@ void write_campaigns(const fs::path& path, const CampaignDays& totals, const Dim
         batch<pq::Int64Writer>(group, assists);
         group->Close();
     }
-    file->Close();
+    file.close();
 }
 } // namespace shop

@@ -16,9 +16,9 @@ For the 14-day input window, each event takes expected constant work. The allowe
 
 `scripts/bench.sh 20000000 19 3` builds the image, runs the organizers' 36 fixtures and exact million-event comparison, then times three fresh containers on a generated practice-size input. Pass `60000000` for final size. The script uses the organizers' public Rust generator and checker, and requires Linux, Docker, Cargo, Python with Polars, curl and unzip. The default limits are eight vCPUs and 24 GB. Set `CPUSET` to the assigned logical CPU list on an N2 host to pin the run. Reported durations use Docker’s container start and exit timestamps.
 
-For a native build, run `make ARROW_PREFIX=/path/to/arrow`. Run `./pipeline INPUT EMPTY_OUTPUT` with `NCPU` set to the desired thread count. Set `PROFILE=1` for stage timings on stderr.
+For a native build, run `make ARROW_PREFIX=/path/to/arrow`. Run `./pipeline INPUT EMPTY_OUTPUT` with `NCPU` set to the desired thread count. Set `PROFILE=1` for stage timings on stderr. Run `python3 scripts/profile.py ./pipeline INPUT EMPTY_OUTPUT` to include process launch and exit. The parent and child use the same monotonic clock.
 
-`python tests/differential.py ./pipeline --generator /path/to/generate` compares the pipeline with an independent chronological reference on six generated seeds and four crafted cases. They cover overlapping, touching and disjoint click windows, unusual IDs, both dense and sparse week storage, and records spanning multiple file chunks.
+`python tests/differential.py ./pipeline --generator /path/to/generate` compares the pipeline with an independent chronological reference on six generated seeds and four crafted cases. They cover overlapping, touching and disjoint click windows, unusual IDs, both dense and sparse week storage, and records spanning multiple file chunks. The chunk-boundary case also forces a file-size error and retries in the same output directory.
 
 ## Measurements
 
@@ -79,6 +79,26 @@ These are pooled medians from two interleaved batches, 24 warm fresh processes p
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | 211 | 36,122,537 | 11,312,487 | 92.82 ms | 89.45 ms | 391.64 ms | 394.11 ms |
 | 307 | 37,093,335 | 11,667,852 | 94.44 ms | 91.11 ms | 389.51 ms | 387.49 ms |
+
+### Process exit and campaign attribution
+
+On seed 719, the baseline took 22.31 ms from launch to entering `main` and 3.07 ms to finish setup. After the last Parquet write, destroying the pipeline took 34.76 ms. The remaining time from leaving `main` until the parent observed exit was 16.50 ms. These are separately measured warm medians. Two first invocations immediately after linking took 183 ms and 569 ms to enter `main` on this Mac.
+
+Each writer now closes the Parquet footer and checks the Arrow stream's close status. Once every writer has returned and every worker has joined, a successful process exits directly so the OS can reclaim its private scratch memory. Errors still unwind and produce a nonzero exit. Attribution walks a list of occupied shopper-days and updates contiguous daily assist counters for each campaign.
+
+A separate diagnostic on seed 719 sampled one in 32 small shoppers and timed every shopper with at least 256 events or 128 clicks. Across all workers it estimated 129 ms collecting events into time buckets, 61 ms forming sessions and 203 ms attributing campaigns. Those worker times overlap. The enclosing stage also groups and scatters records by shopper.
+
+| Generated events / clicks | Seed | Last output close to observed exit, before → after | Sessions and attribution, before → after | Launch to observed exit, before → after |
+| --- | ---: | ---: | ---: | ---: |
+| 20M / 5M | 211 | 49.01 → 19.58 ms | 92.61 → 88.42 ms | 375.12 → 342.18 ms |
+| 20M / 5M | 719 | 51.07 → 19.77 ms | 90.79 → 88.67 ms | 375.34 → 341.82 ms |
+| 60M / 15M | 47 | 119.23 → 47.59 ms | 301.07 → 287.95 ms | 1,162.59 → 1,064.18 ms |
+
+The table pools two interleaved batches on an M4 Max with eight workers and RAM-backed files. Each build ran in 32 warm, fresh processes per practice seed and 19 at final size. End-to-end and session times use the unmodified baseline `4c18cb2`. A separately instrumented copy of that baseline records the output-close and destructor boundaries. The optimized build reports output close directly. On seed 719 the combined launch, setup and post-write time fell from 76.77 to 45.83 ms, calculated per run before taking medians. Both daily tables matched across all three datasets, including all 6,684,549 user-day rows at final size.
+
+On the final-size input, the session stage took 8.66 ms longer in the first batch and 17.63 ms less in the second. The end-to-end gain appeared in both. A 512-shopper-partition experiment improved the first final-size comparison but took 5–15 ms longer end to end across the three inputs in the repeat. The published build uses 256 partitions.
+
+On seed 211 the translated x86-64-v2 fallback under Rosetta took 720.94 ms before and 720.36 ms after across nine interleaved runs per build. Its output matched the baseline. The native Xeon AVX-512 time for this change is unmeasured.
 
 ### Queries on CSV row patterns
 

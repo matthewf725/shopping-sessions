@@ -14,28 +14,61 @@ struct Segment {
     Segment* next = nullptr;
 };
 struct UserDay { Key person; int32_t day, sessions, events; uint32_t top; int64_t revenue; };
-struct Totals { int64_t sessions{}, purchasing{}, revenue{}, assists{}; };
+struct Credits { int64_t sessions{}, purchasing{}, revenue{}; };
+struct Totals : Credits { int64_t assists{}; };
+struct SessionDay { int32_t day; uint32_t stop; }; // Exclusive session rank for this UTC day.
 
 class CampaignDays {
     int32_t first_;
-    size_t campaigns_;
-    std::vector<Totals> dense_;
+    size_t campaigns_, days_;
+    std::vector<Credits> credits_;   // All campaigns for a given day.
+    std::vector<int64_t> assists_;   // All days for a given campaign.
     std::unordered_map<uint64_t, Totals> sparse_;
-public:
-    CampaignDays(const Window& w, size_t campaigns) : first_(utc_day(w.start)), campaigns_(campaigns) {
-        size_t days = utc_day(w.end - 1) - first_ + 1;
-        if (days <= 1'000'000 / campaigns) dense_.resize(days * campaigns);
+
+    uint64_t cell(uint32_t campaign, int32_t day) const {
+        return uint64_t(day - first_) * campaigns_ + campaign;
     }
-    Totals& at(uint32_t campaign, int32_t day) {
-        uint64_t cell = uint64_t(day - first_) * campaigns_ + campaign;
-        return dense_.empty() ? sparse_[cell] : dense_[cell];
+public:
+    CampaignDays(const Window& w, size_t campaigns)
+        : first_(utc_day(w.start)), campaigns_(campaigns), days_(utc_day(w.end - 1) - first_ + 1) {
+        if (days_ <= 1'000'000 / campaigns_) {
+            credits_.resize(days_ * campaigns_);
+            assists_.resize(days_ * campaigns_);
+        }
+    }
+    Credits& credited(uint32_t campaign, int32_t day) {
+        auto i = cell(campaign, day);
+        if (credits_.empty()) return sparse_[i];
+        return credits_[i];
+    }
+    void add_assists(uint32_t campaign, const SessionDay* day, size_t first, size_t stop) {
+        int64_t* counts = assists_.empty() ? nullptr : assists_.data() + campaign * days_;
+        for (; first < stop; ++day) {
+            size_t end = std::min(stop, size_t(day->stop));
+            auto& count = counts ? counts[day->day - first_] : sparse_[cell(campaign, day->day)].assists;
+            count += int64_t(end - first);
+            first = end;
+        }
+    }
+    void add(uint32_t campaign, int32_t day, const Totals& from) {
+        auto& to = credited(campaign, day);
+        to.sessions += from.sessions;
+        to.purchasing += from.purchasing;
+        to.revenue += from.revenue;
+        if (assists_.empty()) sparse_[cell(campaign, day)].assists += from.assists;
+        else assists_[campaign * days_ + size_t(day - first_)] += from.assists;
     }
     template<class F> void each(F fn) const {
-        auto emit = [&](uint64_t i, const Totals& t) {
+        if (!credits_.empty()) {
+            for (size_t d = 0; d < days_; ++d) for (size_t c = 0; c < campaigns_; ++c) {
+                const auto& credit = credits_[d * campaigns_ + c];
+                auto assists = assists_[c * days_ + d];
+                if (credit.sessions || assists) fn(uint32_t(c), first_ + int32_t(d), Totals{credit, assists});
+            }
+        }
+        for (const auto& [i, t] : sparse_) {
             if (t.sessions || t.assists) fn(uint32_t(i % campaigns_), int32_t(i / campaigns_) + first_, t);
-        };
-        for (size_t i = 0; i < dense_.size(); ++i) emit(i, dense_[i]);
-        for (auto& [i, t] : sparse_) emit(i, t);
+        }
     }
 };
 
@@ -69,7 +102,7 @@ class Shopper {
     std::vector<uint32_t> order_, radix_scratch_;
     std::vector<Purchase> purchases_;
     std::vector<Session> sessions_;
-    std::vector<size_t> day_ends_; // Exclusive session rank for each occupied UTC day.
+    std::vector<SessionDay> session_days_;
     std::vector<int64_t> category_sums_;
     std::vector<uint32_t> categories_used_;
     std::vector<AssistRange> coverage_;
@@ -152,18 +185,18 @@ class Shopper {
         }
     }
     void form_sessions(Key person, std::vector<UserDay>& users) {
-        day_ends_.clear();
+        session_days_.clear();
         Time last = invalid_time;
         auto take = [&](const Bucket& b) {
             if (last == invalid_time || b.first - last > gap) {
                 int32_t day = utc_day(b.first);
                 if (sessions_.empty() || sessions_.back().day != day) {
-                    if (!sessions_.empty()) day_ends_.push_back(sessions_.size());
+                    if (!sessions_.empty()) session_days_.push_back({sessions_.back().day, uint32_t(sessions_.size())});
                     clear_categories();
                     users.push_back({person, day, 0, 0, 0, 0});
                 }
                 ++users.back().sessions;
-                sessions_.push_back({b.first, 0, {invalid_time, 0, 0}, day, uint32_t(day_ends_.size())});
+                sessions_.push_back({b.first, 0, {invalid_time, 0, 0}, day, uint32_t(session_days_.size())});
                 if (!bins_.empty()) {
                     uint32_t start = cell(b.first);
                     start_bits_[start >> 6] |= uint64_t(1) << (start & 63);
@@ -203,7 +236,7 @@ class Shopper {
             }
         }
         indexed_ = !bins_.empty();
-        day_ends_.push_back(sessions_.size());
+        session_days_.push_back({sessions_.back().day, uint32_t(sessions_.size())});
         purchases_.clear();
     }
     // Number of session starts < t (or <= t). At most one start can occupy any gap-width cell.
@@ -244,12 +277,7 @@ class Shopper {
             if (first >= next_first) return;
             size_t stop = std::min(next_first, rank(range.latest_click + week_ms, true));
             uint32_t campaign = uint32_t(at % campaign_count_);
-            while (first < stop) {
-                const auto& s = sessions_[first];
-                size_t end = std::min(stop, day_ends_[s.day_index]);
-                campaigns.at(campaign, s.day).assists += end - first;
-                first = end;
-            }
+            campaigns.add_assists(campaign, session_days_.data() + sessions_[first].day_index, first, stop);
         };
         for (size_t at : touched_) {
             size_t next = at + campaign_count_;
@@ -266,7 +294,7 @@ class Shopper {
         for (const auto& s : sessions_) {
             if (s.credit.id) latest = s.credit;
             uint32_t credited = latest.ts >= s.start - week_ms ? latest.campaign : 0;
-            auto& t = campaigns.at(credited, s.day);
+            auto& t = campaigns.credited(credited, s.day);
             ++t.sessions;
             t.purchasing += (s.revenue > 0);
             t.revenue += s.revenue;

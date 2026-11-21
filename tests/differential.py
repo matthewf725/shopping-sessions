@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 import random
 import re
+import resource
+import signal
 import subprocess
 import tempfile
 
@@ -253,6 +255,16 @@ def check(exe, data, output):
     print(f'exact match: {data.name}')
 
 
+def check_failed_write(exe, data, output):
+    def limit_output():
+        signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+        resource.setrlimit(resource.RLIMIT_FSIZE, (1, 1))
+
+    failed = subprocess.run([exe, data, output], env=dict(os.environ, NCPU='1', PROFILE='1'),
+                            preexec_fn=limit_output, stderr=subprocess.PIPE, text=True)
+    assert failed.returncode == 1 and 'output_closed_ns' not in failed.stderr, failed.stderr
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('pipeline', type=Path)
@@ -266,6 +278,7 @@ if __name__ == '__main__':
             check(args.pipeline.resolve(), data, root / (data.name+'-out'))
         data = root / 'chunk-boundaries'
         chunk_boundaries(data)
+        check_failed_write(args.pipeline.resolve(), data, root / 'chunk-out')
         check(args.pipeline.resolve(), data, root / 'chunk-out')
         if args.generator:
             for seed in (0, 3, 11, 19, 47, 2147483661):

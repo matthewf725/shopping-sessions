@@ -1,6 +1,7 @@
 #include "output.hpp"
 #include <atomic>
 #include <cstdlib>
+#include <ctime>
 #include <iostream>
 #include <thread>
 
@@ -55,6 +56,35 @@ template<class F> void parallel(size_t n, size_t jobs, F fn) {
     if (failure) std::rethrow_exception(failure);
 }
 
+class Profile {
+    bool enabled_ = std::getenv("PROFILE") != nullptr;
+    int64_t last_ = 0;
+    static int64_t now_ns() {
+        timespec time;
+        clock_gettime(CLOCK_MONOTONIC, &time);
+        return int64_t(time.tv_sec) * 1'000'000'000 + time.tv_nsec;
+    }
+public:
+    Profile() {
+        if (enabled_) {
+            last_ = now_ns();
+            std::fprintf(stderr, "main_start_ns %lld\n", static_cast<long long>(last_));
+        }
+    }
+    void mark(const char* stage) {
+        if (!enabled_) return;
+        auto now = now_ns();
+        std::fprintf(stderr, "%s %.9f s\n", stage, double(now - last_) / 1e9);
+        last_ = now;
+    }
+    void finish() const {
+        if (enabled_) {
+            std::fprintf(stderr, "output_closed_ns %lld\n", static_cast<long long>(last_));
+            std::fflush(stderr);
+        }
+    }
+};
+
 struct Pipeline {
     Window window;
     Dimensions dim;
@@ -63,13 +93,6 @@ struct Pipeline {
     struct RawStore { std::vector<Event> events; std::vector<Click> clicks; };
     std::array<RawStore, partitions> stores;
     std::vector<Worker> workers;
-    using Timer = std::chrono::steady_clock;
-    Timer::time_point last = Timer::now();
-    void mark(const char* stage) {
-        auto now = Timer::now();
-        if (getenv("PROFILE")) std::cerr << stage << ' ' << std::chrono::duration<double>(now-last).count() << " s\n";
-        last = now;
-    }
     Pipeline(const fs::path& data, size_t n) : window(data / "manifest.json"), dim(data) {
         workers.reserve(n);
         for (size_t i = 0; i < n; ++i) workers.emplace_back(uint32_t(i), window, dim, click_keys);
@@ -237,13 +260,13 @@ struct Pipeline {
         for (auto& slot : groups.slots()) if (slot.key) dst.shopper.run(slot.key, slot.value, dst.days, dst.campaigns);
         for (auto& w : workers) std::vector<Segment>().swap(w.segments[p]);
     }
-    void run(const fs::path& data, const fs::path& output) {
-        read(data); mark("parse and link");
+    void run(const fs::path& data, const fs::path& output, Profile& profile) {
+        read(data); profile.mark("parse and link");
         parallel(workers.size(), partitions, [&](size_t wi, size_t p) { dedup(p, workers[wi]); });
-        mark("deduplicate and partition");
+        profile.mark("deduplicate and partition");
         parallel(workers.size(), partitions, [&](size_t wi, size_t p) { group_aliases(p, workers[wi]); });
         parallel(workers.size(), partitions, [&](size_t wi, size_t p) { join_aliases(p, workers[wi]); });
-        mark("sessions and attribution");
+        profile.mark("sessions and attribution");
         fs::create_directories(output / "user_daily");
         fs::create_directories(output / "campaign_daily");
         parallel(workers.size(), workers.size() + 1, [&](size_t, size_t part) {
@@ -253,24 +276,29 @@ struct Pipeline {
             } else {
                 CampaignDays total(window, dim.names.size());
                 for (auto& w : workers) w.campaigns.each([&](uint32_t c, int32_t day, const Totals& from) {
-                    auto& t = total.at(c, day);
-                    t.sessions += from.sessions; t.purchasing += from.purchasing; t.revenue += from.revenue; t.assists += from.assists;
+                    total.add(c, day, from);
                 });
                 write_campaigns(output / "campaign_daily" / "part-0.parquet", total, dim);
             }
         });
-        mark("write parquet");
+        profile.mark("write parquet");
     }
 };
 } // namespace shop
 
 int main(int argc, char** argv) {
+    shop::Profile profile;
     try {
         auto env = [](const char* key, const char* fallback) { auto value = getenv(key); return value ? value : fallback; };
         shop::fs::path data = argc > 1 ? argv[1] : env("DATA_DIR", "/data");
         shop::fs::path output = argc > 2 ? argv[2] : env("OUTPUT_DIR", "/output");
         size_t threads = std::clamp(std::stoi(env("NCPU", "8")), 1, 64);
         shop::Pipeline pipeline(data, threads);
-        pipeline.run(data, output);
+        profile.mark("setup");
+        pipeline.run(data, output, profile);
+        profile.finish();
+        // All Parquet files are closed and every worker has joined. The OS can
+        // reclaim the process-private scratch buffers together on successful exit.
+        std::_Exit(EXIT_SUCCESS);
     } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
 }
