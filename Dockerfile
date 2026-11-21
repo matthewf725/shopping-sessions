@@ -1,4 +1,5 @@
-FROM gcc:12-bookworm AS build
+FROM debian:bookworm-slim AS build
+RUN apt-get update && apt-get install -y --no-install-recommends g++ make && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
 COPY Makefile .
 COPY src/ src/

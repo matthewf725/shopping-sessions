@@ -141,7 +141,7 @@ struct Pipeline {
                 w.parsed[id >> 56].push_back({id, person, {uint32_t(packed), uint32_t(packed >> 32)}});
             });
         };
-        auto projection = EventProjection{consume, accelerate};
+        auto projection = BatchProjection{consume, accelerate};
 #else
         auto& projection = consume;
 #endif
@@ -150,7 +150,7 @@ struct Pipeline {
         }, projection);
     }
     void parse_clicks(Chunk chunk, Worker& w) {
-        read_rows<4>(chunk, [&](const auto& f) {
+        auto consume = [&](const auto& f) {
             if (f[0].empty() || f[1].empty()) return;
             uint32_t campaign = dim.campaigns.get(f[2]);
             if (!campaign) return;
@@ -158,7 +158,18 @@ struct Pipeline {
             if (ts < window.start - week_ms || ts >= window.end) return;
             Key raw_user = users.encode(f[1]);
             w.clicks[partition(raw_user)].push_back({raw_user, {ts, click_keys.encode(f[0]), campaign}});
-        });
+        };
+#if defined(__AVX512BW__) && defined(__AVX512DQ__) && defined(__AVX512VL__)
+        auto accelerate = [&](const char* data, const uint32_t* offsets, const uint16_t* rows) {
+            return ClickLanes::parse(window, dim.campaigns, data, offsets, rows,
+                [&](size_t shard, Key person, Key id, Time time, uint32_t campaign) {
+                    w.clicks[shard].push_back({person, {time, id, campaign}});
+                });
+        };
+        read_rows<4>(chunk, consume, BatchProjection{consume, accelerate});
+#else
+        read_rows<4>(chunk, consume);
+#endif
     }
     void read(const fs::path& data) {
         CsvFiles ev(data / "events"), ck(data / "clicks"), links(data / "links");

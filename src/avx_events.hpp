@@ -1,7 +1,7 @@
 #pragma once
 #if defined(__AVX512BW__) && defined(__AVX512DQ__) && defined(__AVX512VL__)
 namespace shop {
-template <class Scalar, class Batch> struct EventProjection {
+template <class Scalar, class Batch> struct BatchProjection {
     Scalar scalar;
     Batch batch;
     template <class... Args> void operator()(Args&&... args) const {
@@ -146,6 +146,78 @@ struct EventLanes {
         for (unsigned bits = good; bits; bits &= bits - 1) {
             unsigned i = std::countr_zero(bits);
             store(ids[i], people[i], values[i]);
+        }
+        return good;
+    }
+};
+struct ClickLanes : EventLanes {
+    template <class Store>
+    static M parse(const Window& window, const Catalog& catalog, const char* data, const uint32_t* cuts,
+                   const uint16_t* rows, Store store) {
+        I index = _mm256_cvtepu16_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(rows)));
+        I c[5];
+        for (unsigned i = 0; i < 5; ++i)
+            c[i] = _mm256_i32gather_epi32(reinterpret_cast<const int*>(cuts + i), index, 4);
+        Field id = field(data, c[0], c[1]), user = field(data, c[1], c[2]),
+              campaign = field(data, c[2], c[3]), time = field(data, c[3], c[4]);
+        I ndigits = _mm256_sub_epi32(campaign.size, integer(2));
+        M good = _mm256_cmp_epu32_mask(_mm256_sub_epi32(ndigits, integer(1)), integer(3), _MM_CMPINT_LE);
+        V spelling = load8(data, campaign.start);
+        good &= _mm512_cmpeq_epi64_mask(spelling & number(65535), number(0x5f63));
+        V digits = _mm512_sub_epi8(_mm512_srli_epi64(spelling, 16), _mm512_set1_epi8('0'));
+        good &= _mm256_cmpeq_epi32_mask(ndigits, integer(1)) |
+                _mm512_cmpneq_epi64_mask(digits & number(255), number(0));
+        V shift = _mm512_slli_epi64(_mm512_cvtepu32_epi64(_mm256_sub_epi32(integer(4), ndigits)), 3);
+        digits = _mm512_sllv_epi64(digits, shift) & number(UINT32_MAX);
+        good &= _mm512_cmpeq_epi64_mask(_mm512_subs_epu8(digits, _mm512_set1_epi8(9)), number(0));
+        V pairs = _mm512_maddubs_epi16(digits, _mm512_set1_epi16(0x010a));
+        I code = _mm512_cvtepi64_epi32(_mm512_madd_epi16(pairs, _mm512_set1_epi32(0x00010064)));
+        good &= _mm256_cmp_epu32_mask(code, integer(catalog.dense_.size()), _MM_CMPINT_LT);
+        I number_id =
+            _mm256_mmask_i32gather_epi32(_mm256_setzero_si256(), good, code, catalog.dense_.data(), 4);
+        good &= _mm256_cmpneq_epi32_mask(number_id, integer(0));
+        V person = keys(data, user, 'u', good), click = keys(data, id, 'k', good);
+        V head = load8(data, time.start), date = load8(data + 8, time.start);
+        M iso = _mm256_cmpeq_epi32_mask(time.size, integer(20));
+        V dt = _mm512_sub_epi8(date, _mm512_set1_epi8('0'));
+        iso &= _mm512_cmp_epu64_mask(dt & number(255), number(3), _MM_CMPINT_LE) &
+               _mm512_cmp_epu64_mask(_mm512_srli_epi64(dt, 8) & number(255), number(9), _MM_CMPINT_LE);
+        iso &= _mm512_cmpeq_epi64_mask(_mm512_srli_epi64(date, 16) & number(255), number('T'));
+        V slot = _mm512_slli_epi64(date & number(3), 4) | (_mm512_srli_epi64(date, 8) & number(15));
+        I di = _mm512_cvtepi64_epi32(_mm512_add_epi64(slot, _mm512_slli_epi64(slot, 1)));
+        const auto* days = window.ingest_days_.data();
+        iso &= _mm512_cmpeq_epi64_mask(head, lookup(&days->month_prefix, di)) &
+               _mm512_cmpneq_epi64_mask(head, number(0));
+        iso &= _mm512_cmpeq_epi64_mask(load8(data + 19, time.start) & number(255), number('Z'));
+        V iso_time =
+            _mm512_add_epi64(lookup(&days->midnight, di),
+                             _mm512_mul_epu32(seconds(load8(data + 11, time.start), iso), number(1000)));
+        M epoch = _mm256_cmpeq_epi32_mask(time.size, integer(13));
+        V eslot = _mm512_slli_epi64(_mm512_srli_epi64(head, 24) & number(3), 4) |
+                  (_mm512_srli_epi64(head, 32) & number(15));
+        I ei = _mm512_cvtepi64_epi32(_mm512_slli_epi64(eslot, 1));
+        const auto* pref = window.epoch_prefixes_.data();
+        V prefix = lookup(&pref->text, ei);
+        epoch &= _mm512_cmpeq_epi64_mask(head & number(0xffffffffffULL), prefix) &
+                 _mm512_cmpneq_epi64_mask(prefix, number(0));
+        V epoch_time =
+            _mm512_add_epi64(lookup(&pref->base, ei), decimal8(load8(data + 5, time.start), epoch));
+        V ts = _mm512_mask_blend_epi64(iso, epoch_time, iso_time);
+        good &= (iso | epoch) & _mm512_cmp_epi64_mask(ts, number(window.start - week_ms), _MM_CMPINT_GE) &
+                _mm512_cmp_epi64_mask(ts, number(window.end), _MM_CMPINT_LT);
+        V hash = person ^ _mm512_srli_epi64(person, 32);
+        hash = _mm512_mullo_epi64(hash, number(0xd6e8feb86659fd93ULL));
+        hash ^= _mm512_srli_epi64(hash, 32);
+        alignas(64) uint64_t names[8], ids[8], times[8], shards[8];
+        alignas(32) uint32_t campaigns[8];
+        _mm512_store_si512(names, person);
+        _mm512_store_si512(ids, click);
+        _mm512_store_si512(times, ts);
+        _mm512_store_si512(shards, _mm512_srli_epi64(hash, 56));
+        _mm256_store_si256(reinterpret_cast<I*>(campaigns), number_id);
+        for (unsigned bits = good; bits; bits &= bits - 1) {
+            unsigned i = std::countr_zero(bits);
+            store(shards[i], names[i], ids[i], Time(times[i]), campaigns[i]);
         }
         return good;
     }

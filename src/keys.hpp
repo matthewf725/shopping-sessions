@@ -149,6 +149,7 @@ public:
 // Exact lookup with a dense fast path for p123 and c_123. Verify the spelling
 // before indexing so case variants and leading zeroes keep their identities.
 class Catalog {
+    friend struct ClickLanes;
     std::string prefix_;
     std::vector<uint32_t> dense_;
     std::unordered_map<std::string, uint32_t> other_;

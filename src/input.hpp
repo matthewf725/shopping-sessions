@@ -408,7 +408,7 @@ struct OffsetTile {
                 const char* first = data + uint32_t(cuts[column] + 1);
                 return CsvTile<N>::field(first, data + cuts[column + 1]);
             };
-            if constexpr (std::is_same_v<Project, std::nullptr_t>) {
+            if constexpr (std::is_same_v<Project, std::nullptr_t> || N == 4) {
                 std::array<Text, N> fields;
                 for (size_t j = 0; j < N; ++j) fields[j] = text(j);
                 handle(fields);
@@ -645,6 +645,7 @@ inline int32_t utc_day(Time t) { return int32_t(t / day_ms - (t % day_ms < 0)); 
 
 struct Window {
     friend struct EventLanes;
+    friend struct ClickLanes;
     Clock clock;
     Time start, end;
     struct Arrival {
@@ -737,9 +738,9 @@ public:
         end = clock.parse(field("window_end"));
         if (start == invalid_time || end == invalid_time || end <= start) throw std::runtime_error("invalid window");
         using namespace std::chrono;
-        // A 14-day window has at most 14 possible five-digit prefixes for epoch milliseconds.
+        // Include the seven-day click lookback when warming the epoch prefix cache.
         constexpr Time unit = 100'000'000;
-        Time low = std::max<Time>(start, 0) / unit;
+        Time low = std::max<Time>(start - week_ms, 0) / unit;
         Time high = std::min<Time>(99'999, (end - 1) / unit);
         for (Time n = low; n <= std::min(high, low + 31); ++n) {
             char digits[6];
@@ -751,7 +752,7 @@ public:
         first_day_ = utc_day(start);
         // Cache near-window dates. arrival() checks the month before using a slot.
         int32_t last = std::min(utc_day(end - 1) + 6, first_day_ + 28);
-        for (int32_t day = first_day_ - 1; day <= last; ++day) {
+        for (int32_t day = first_day_ - 8; day <= last; ++day) {
             year_month_day d{sys_days{days(day)}};
             int y = int(d.year());
             if (y < 0 || y > 9999) continue;
