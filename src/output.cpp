@@ -1,111 +1,339 @@
 #include "output.hpp"
-#include <arrow/io/file.h>
-#include <arrow/result.h>
-#include <parquet/column_writer.h>
-#include <parquet/file_writer.h>
-#include <parquet/schema.h>
+#include <cerrno>
+#include <memory>
+#include <span>
+#include <system_error>
 
 namespace shop {
-namespace pq = parquet;
-using Node = pq::schema::NodePtr;
-using Type = pq::Type;
-using Logical = pq::ConvertedType;
+namespace {
+class Bytes {
+    std::unique_ptr<uint8_t[]> memory_;
+    size_t size_ = 0, capacity_ = 0;
+    [[gnu::noinline]] void grow(size_t need) {
+        size_t cap = std::max(need, std::max<size_t>(64, capacity_ + capacity_ / 2));
+        auto next = std::make_unique_for_overwrite<uint8_t[]>(cap);
+        if (size_)
+            memcpy(next.get(), memory_.get(), size_);
+        memory_ = std::move(next);
+        capacity_ = cap;
+    }
 
-static Node column(const char* name, Type::type type, Logical::type logical = Logical::NONE, bool nullable = false) {
-    return pq::schema::PrimitiveNode::Make(name, nullable ? pq::Repetition::OPTIONAL : pq::Repetition::REQUIRED, type, logical);
-}
-struct OutputFile {
-    std::shared_ptr<arrow::io::FileOutputStream> stream;
-    std::unique_ptr<pq::ParquetFileWriter> parquet;
-
-    void close() {
-        parquet->Close();
-        if (!stream->closed()) {
-            auto status = stream->Close();
-            if (!status.ok()) throw std::runtime_error(status.ToString());
+public:
+    size_t size() const {
+        return size_;
+    }
+    uint8_t* data() const {
+        return memory_.get();
+    }
+    void reset(size_t capacity = 0) {
+        size_ = 0;
+        if (capacity > capacity_)
+            grow(capacity);
+    }
+    uint8_t* append(size_t n) {
+        if (n > SIZE_MAX - size_)
+            throw std::length_error("Parquet buffer is too large");
+        if (size_ + n > capacity_)
+            grow(size_ + n);
+        auto* dest = memory_.get() + size_;
+        size_ += n;
+        return dest;
+    }
+    void byte(uint8_t x) {
+        *append(1) = x;
+    }
+    void varint(uint64_t n) {
+        while (n >= 128) {
+            byte(uint8_t(n) | 128);
+            n >>= 7;
         }
+        byte(uint8_t(n));
+    }
+    void integer(uint64_t n) {
+        varint(n << 1);
+    } // Metadata integers in these schemas are nonnegative.
+    void raw(Text s) {
+        if (!s.empty())
+            memcpy(append(s.size()), s.data(), s.size());
+    }
+    void thrift_string(Text s) {
+        varint(s.size());
+        raw(s);
+    }
+    static uint32_t narrow(size_t n) {
+        if (n > INT32_MAX)
+            throw std::length_error("Parquet page or byte array exceeds INT32");
+        return uint32_t(n);
+    }
+    template <class T> static void write_le(uint8_t* p, T n) {
+        if constexpr (std::endian::native == std::endian::big) {
+            if constexpr (sizeof(T) == 4)
+                n = T(__builtin_bswap32(uint32_t(n)));
+            else
+                n = T(__builtin_bswap64(uint64_t(n)));
+        }
+        memcpy(p, &n, sizeof n);
+    }
+    void plain_string(Text value) {
+        write_le(append(4), narrow(value.size()));
+        raw(value);
     }
 };
+enum CompactType : uint8_t { i32 = 5, i64 = 6, binary = 8, list = 9, structure = 12 };
+struct Fields {
+    Bytes& data;
+    unsigned last = 0;
+    void field(unsigned id, CompactType type) {
+        data.byte(uint8_t((id - last) << 4) | type);
+        last = id;
+    }
+    void number(unsigned id, CompactType type, uint64_t n) {
+        field(id, type);
+        data.integer(n);
+    }
+    void string(unsigned id, Text v) {
+        field(id, binary);
+        data.thrift_string(v);
+    }
+    void sequence(unsigned id, CompactType elem, size_t count) {
+        field(id, list);
+        data.byte(uint8_t(std::min<size_t>(count, 15) << 4) | elem);
+        if (count >= 15)
+            data.varint(count);
+    }
+    void end() {
+        data.byte(0);
+    }
+};
+enum class Storage { integer32 = 1, integer64 = 2, text = 6 };
+struct Column {
+    const char* name;
+    Storage storage;
+    int logical = -1;
+    bool nullable = false;
+};
+constexpr Column user_schema[] = {
+    {"user_id", Storage::text, 0},         {"day", Storage::integer32, 6},
+    {"sessions", Storage::integer32},      {"events", Storage::integer32},
+    {"revenue_cents", Storage::integer64}, {"top_category", Storage::text, 0, true}};
+constexpr Column campaign_schema[] = {{"campaign_id", Storage::text, 0},
+                                      {"channel", Storage::text, 0},
+                                      {"day", Storage::integer32, 6},
+                                      {"sessions", Storage::integer64},
+                                      {"purchasing_sessions", Storage::integer64},
+                                      {"revenue_cents", Storage::integer64},
+                                      {"assisted_sessions", Storage::integer64}};
+struct ChunkLocation {
+    uint64_t start, bytes;
+};
+struct Group {
+    size_t rows;
+    uint64_t bytes = 0;
+    std::array<ChunkLocation, 7> columns{};
+};
+struct FileCloser {
+    void operator()(FILE* f) const {
+        fclose(f);
+    }
+};
+class File {
+    std::unique_ptr<FILE, FileCloser> stream_;
+    std::span<const Column> schema_;
+    uint64_t offset_ = 0, rows_ = 0;
+    std::vector<Group> groups_;
+    Bytes header_;
+    void write(const void* data, size_t n) {
+        if (n && fwrite(data, 1, n, stream_.get()) != n)
+            throw std::system_error(errno, std::generic_category(), "write Parquet");
+        offset_ += n;
+    }
+    void column_meta(const Column& c, const ChunkLocation& chunk, size_t n) {
+        Fields container{header_};
+        container.number(2, i64, 0);
+        container.field(3, structure);
+        Fields m{header_};
+        m.number(1, i32, unsigned(c.storage));
+        m.sequence(2, i32, c.nullable ? 2 : 1);
+        header_.integer(0);
+        if (c.nullable)
+            header_.integer(3);
+        m.sequence(3, binary, 1);
+        header_.thrift_string(c.name);
+        m.number(4, i32, 0);
+        m.number(5, i64, n);
+        m.number(6, i64, chunk.bytes);
+        m.number(7, i64, chunk.bytes);
+        m.number(9, i64, chunk.start);
+        m.end();
+        container.end();
+    }
 
-static OutputFile writer(const fs::path& path, const std::vector<Node>& fields) {
-    auto result = arrow::io::FileOutputStream::Open(path.string());
-    if (!result.ok()) throw std::runtime_error(result.status().ToString());
-    auto schema = std::static_pointer_cast<pq::schema::GroupNode>(
-        pq::schema::GroupNode::Make("data", pq::Repetition::REQUIRED, fields));
-    auto props = pq::WriterProperties::Builder().disable_dictionary()->disable_statistics()->build();
-    return {*result, pq::ParquetFileWriter::Open(*result, schema, props)};
-}
-
-template<class Writer, class T>
-static void batch(pq::RowGroupWriter* group, const std::vector<T>& values) {
-    static_cast<Writer*>(group->NextColumn())->WriteBatch(values.size(), nullptr, nullptr, values.data());
-}
-static pq::ByteArray bytes(const std::string& s) {
-    return {uint32_t(s.size()), reinterpret_cast<const uint8_t*>(s.data())};
-}
-void write_users(const fs::path& path, const std::vector<UserDay>& rows, const Keys& users, const Dimensions& d) {
-    auto file = writer(path, {column("user_id", Type::BYTE_ARRAY, Logical::UTF8), column("day", Type::INT32, Logical::DATE),
-        column("sessions", Type::INT32), column("events", Type::INT32), column("revenue_cents", Type::INT64),
-        column("top_category", Type::BYTE_ARRAY, Logical::UTF8, true)});
-    constexpr size_t batch_size = 64 * 1024;
-    for (size_t at = 0; at < rows.size(); at += batch_size) {
-        size_t n = std::min(batch_size, rows.size() - at);
-        std::vector<std::string> names;
-        names.reserve(n);
-        std::vector<pq::ByteArray> ids(n), cats;
-        std::vector<int32_t> days(n), sessions(n), events(n);
-        std::vector<int64_t> revenue(n);
-        std::vector<int16_t> present(n);
-        Key last = 0;
-        for (size_t j = 0; j < n; ++j) {
-            const auto& row = rows[at + j];
-            if (row.person != last) { names.push_back(users.decode(row.person)); last = row.person; }
-            ids[j] = bytes(names.back());
-            days[j] = row.day;
-            sessions[j] = row.sessions;
-            events[j] = row.events;
-            revenue[j] = row.revenue;
-            present[j] = row.top != 0;
-            if (row.top) cats.push_back(bytes(d.categories[row.top - 1]));
+public:
+    Bytes page;
+    File(const fs::path& name, std::span<const Column> schema)
+        : stream_(fopen(name.c_str(), "wb")), schema_(schema) {
+        if (!stream_)
+            throw std::system_error(errno, std::generic_category(), "open " + name.string());
+        write("PAR1", 4);
+    }
+    void group(size_t rows) {
+        groups_.push_back({rows});
+        rows_ += rows;
+    }
+    void column(size_t index) {
+        auto& g = groups_.back();
+        unsigned bytes = Bytes::narrow(page.size());
+        header_.reset(80);
+        Fields head{header_};
+        head.number(1, i32, 0);
+        head.number(2, i32, bytes);
+        head.number(3, i32, bytes);
+        head.field(5, structure);
+        Fields d{header_};
+        d.number(1, i32, g.rows);
+        d.number(2, i32, 0);
+        d.number(3, i32, 3);
+        d.number(4, i32, 3);
+        d.end();
+        head.end();
+        auto& loc = g.columns[index];
+        loc = {offset_, header_.size() + bytes};
+        g.bytes += loc.bytes;
+        write(header_.data(), header_.size());
+        write(page.data(), page.size());
+    }
+    template <class T, class F> void numbers(size_t index, size_t n, F get) {
+        page.reset(n * sizeof(T));
+        uint8_t* dest = page.append(n * sizeof(T));
+        for (size_t i = 0; i < n; ++i)
+            Bytes::write_le(dest + i * sizeof(T), T(get(i)));
+        column(index);
+    }
+    void close() {
+        header_.reset();
+        Fields m{header_};
+        m.number(1, i32, 1);
+        m.sequence(2, structure, schema_.size() + 1);
+        Fields root{header_};
+        root.string(4, "data");
+        root.number(5, i32, schema_.size());
+        root.end();
+        for (const auto& c : schema_) {
+            Fields s{header_};
+            s.number(1, i32, unsigned(c.storage));
+            s.number(3, i32, unsigned(c.nullable));
+            s.string(4, c.name);
+            if (c.logical >= 0)
+                s.number(6, i32, unsigned(c.logical));
+            s.end();
         }
-        auto* group = file.parquet->AppendRowGroup();
-        batch<pq::ByteArrayWriter>(group, ids);
-        batch<pq::Int32Writer>(group, days);
-        batch<pq::Int32Writer>(group, sessions);
-        batch<pq::Int32Writer>(group, events);
-        batch<pq::Int64Writer>(group, revenue);
-        static_cast<pq::ByteArrayWriter*>(group->NextColumn())->WriteBatch(n, present.data(), nullptr, cats.data());
-        group->Close();
+        m.number(3, i64, rows_);
+        m.sequence(4, structure, groups_.size());
+        for (const auto& g : groups_) {
+            Fields rg{header_};
+            rg.sequence(1, structure, schema_.size());
+            for (size_t i = 0; i < schema_.size(); ++i)
+                column_meta(schema_[i], g.columns[i], g.rows);
+            rg.number(2, i64, g.bytes);
+            rg.number(3, i64, g.rows);
+            rg.end();
+        }
+        m.end();
+        uint8_t size[4];
+        Bytes::write_le(size, Bytes::narrow(header_.size()));
+        write(header_.data(), header_.size());
+        write(size, 4);
+        write("PAR1", 4);
+        if (fclose(stream_.release()))
+            throw std::system_error(errno, std::generic_category(), "close Parquet");
     }
-    file.close();
+};
+// Allow the four-byte length, the definition bit, and the page's level header.
+size_t rows_per_group(size_t longest_string) {
+    if (longest_string > size_t(INT32_MAX) - 12)
+        throw std::length_error("String exceeds Parquet page capacity");
+    return std::min<size_t>(65536, (size_t(INT32_MAX) - 7) / (longest_string + 5));
 }
-void write_campaigns(const fs::path& path, const CampaignDays& totals, const Dimensions& d) {
-    auto file = writer(path, {column("campaign_id", Type::BYTE_ARRAY, Logical::UTF8), column("channel", Type::BYTE_ARRAY, Logical::UTF8),
-        column("day", Type::INT32, Logical::DATE), column("sessions", Type::INT64), column("purchasing_sessions", Type::INT64),
-        column("revenue_cents", Type::INT64), column("assisted_sessions", Type::INT64)});
-    std::vector<pq::ByteArray> ids, channels;
-    std::vector<int32_t> days;
-    std::vector<int64_t> sessions, purchasing, revenue, assists;
-    totals.each([&](uint32_t c, int32_t day, const Totals& t) {
-        ids.push_back(bytes(d.names[c].id));
-        channels.push_back(bytes(d.names[c].channel));
-        days.push_back(day);
-        sessions.push_back(t.sessions);
-        purchasing.push_back(t.purchasing);
-        revenue.push_back(t.revenue);
-        assists.push_back(t.assists);
-    });
-    if (!days.empty()) {
-        auto* group = file.parquet->AppendRowGroup();
-        batch<pq::ByteArrayWriter>(group, ids);
-        batch<pq::ByteArrayWriter>(group, channels);
-        batch<pq::Int32Writer>(group, days);
-        batch<pq::Int64Writer>(group, sessions);
-        batch<pq::Int64Writer>(group, purchasing);
-        batch<pq::Int64Writer>(group, revenue);
-        batch<pq::Int64Writer>(group, assists);
-        group->Close();
+} // namespace
+
+void write_users(const fs::path& path, const std::vector<UserDay>& rows, const Keys& users,
+                 const Dimensions& dimensions) {
+    File f(path, user_schema);
+    size_t width = users.longest();
+    for (const auto& category : dimensions.categories)
+        width = std::max(width, category.size());
+    const size_t group_rows = rows_per_group(width);
+    for (size_t base = 0; base < rows.size(); base += group_rows) {
+        auto* row = rows.data() + base;
+        size_t n = std::min(group_rows, rows.size() - base);
+        f.group(n);
+        auto& data = f.page;
+        data.reset(n * 13);
+        Key previous = 0;
+        std::string id;
+        for (size_t i = 0; i < n; ++i) {
+            if (row[i].person != previous) {
+                previous = row[i].person;
+                id = users.decode(previous);
+            }
+            data.plain_string(id);
+        }
+        f.column(0);
+        f.numbers<int32_t>(1, n, [&](size_t i) { return row[i].day; });
+        f.numbers<int32_t>(2, n, [&](size_t i) { return row[i].sessions; });
+        f.numbers<int32_t>(3, n, [&](size_t i) { return row[i].events; });
+        f.numbers<int64_t>(4, n, [&](size_t i) { return row[i].revenue; });
+        size_t groups = (n + 7) / 8;
+        data.reset(12 + groups + n * 3);
+        data.append(4);
+        data.varint(2 * groups + 1);
+        size_t bitstart = data.size();
+        auto* levels = data.append(groups);
+        for (size_t i = 0; i < n; i += 8) {
+            unsigned bits = 0;
+            for (unsigned j = 0; j < std::min<size_t>(8, n - i); ++j)
+                bits |= unsigned(row[i + j].top != 0) << j;
+            levels[i >> 3] = uint8_t(bits);
+        }
+        Bytes::write_le(data.data(), uint32_t(bitstart + groups - 4));
+        for (size_t i = 0; i < n; ++i)
+            if (row[i].top)
+                data.plain_string(dimensions.categories[row[i].top - 1]);
+        f.column(5);
     }
-    file.close();
+    f.close();
+}
+void write_campaigns(const fs::path& path, const CampaignDays& totals, const Dimensions& dimensions) {
+    struct Row {
+        uint32_t campaign;
+        int32_t day;
+        Totals sum;
+    };
+    std::vector<Row> rows;
+    totals.each([&](uint32_t c, int32_t day, const Totals& t) { rows.push_back({c, day, t}); });
+    File f(path, campaign_schema);
+    size_t width = 0;
+    for (const auto& name : dimensions.names)
+        width = std::max({width, name.id.size(), name.channel.size()});
+    const size_t group_rows = rows_per_group(width);
+    for (size_t base = 0; base < rows.size(); base += group_rows) {
+        auto* row = rows.data() + base;
+        size_t n = std::min(group_rows, rows.size() - base);
+        f.group(n);
+        for (unsigned j = 0; j < 2; ++j) {
+            f.page.reset(n * 12);
+            for (size_t i = 0; i < n; ++i) {
+                auto& c = dimensions.names[row[i].campaign];
+                f.page.plain_string(j ? c.channel : c.id);
+            }
+            f.column(j);
+        }
+        f.numbers<int32_t>(2, n, [&](size_t i) { return row[i].day; });
+        f.numbers<int64_t>(3, n, [&](size_t i) { return row[i].sum.sessions; });
+        f.numbers<int64_t>(4, n, [&](size_t i) { return row[i].sum.purchasing; });
+        f.numbers<int64_t>(5, n, [&](size_t i) { return row[i].sum.revenue; });
+        f.numbers<int64_t>(6, n, [&](size_t i) { return row[i].sum.assists; });
+    }
+    f.close();
 }
 } // namespace shop

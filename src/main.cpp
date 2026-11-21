@@ -1,4 +1,5 @@
 #include "output.hpp"
+#include "avx_events.hpp"
 #include <atomic>
 #include <cstdlib>
 #include <ctime>
@@ -134,9 +135,19 @@ struct Pipeline {
             // Keep invalid copies by event ID so the earliest ingestion still wins.
             store_event(w, id, valid ? users.encode(person) : 0, ts, arrival.order, price, category);
         };
+#if defined(__AVX512BW__) && defined(__AVX512DQ__) && defined(__AVX512VL__)
+        auto accelerate = [&](const char* data, const uint32_t* offsets, const uint16_t* rows) {
+            return EventLanes::run(window, data, offsets, rows, [&](Key id, Key person, uint64_t packed) {
+                w.parsed[id >> 56].push_back({id, person, {uint32_t(packed), uint32_t(packed >> 32)}});
+            });
+        };
+        auto projection = EventProjection{consume, accelerate};
+#else
+        auto& projection = consume;
+#endif
         read_rows<7>(chunk, [&](const auto& f) {
             consume(f[0], f[1], f[2], f[3], f[4], !f[5].empty(), [&] { return std::pair{f[5], f[6]}; });
-        }, consume);
+        }, projection);
     }
     void parse_clicks(Chunk chunk, Worker& w) {
         read_rows<4>(chunk, [&](const auto& f) {

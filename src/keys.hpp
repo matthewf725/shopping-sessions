@@ -20,6 +20,7 @@ class Keys {
     char prefix_;
     mutable std::mutex mutex_;
     std::deque<std::string> other_;
+    size_t longest_ = 9;
     std::unordered_map<Text, Key> index_;
     Key intern(Text s) {
         std::lock_guard lock(mutex_);
@@ -27,6 +28,7 @@ class Keys {
         if (it != index_.end()) return it->second;
         Key k = external_bit | other_.size();
         other_.emplace_back(s);
+        longest_ = std::max(longest_, s.size());
         index_.emplace(other_.back(), k);
         return k;
     }
@@ -47,6 +49,10 @@ public:
             return n >= 7 ? word << (8 * (8 - n)) : word;
         }
         return intern(s);
+    }
+    size_t longest() const {
+        std::lock_guard lock(mutex_);
+        return longest_;
     }
     std::string decode(Key k) const {
         if (k & external_bit) {

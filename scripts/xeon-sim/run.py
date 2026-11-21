@@ -117,7 +117,9 @@ def simulate(args, work):
         disk.addfile(loader)
         for name in ("libarrow.so.2100", "libparquet.so.2100"):
             relative = "opt/arrow/lib/" + name
-            disk.add((rootfs / relative).resolve(), relative)
+            library = rootfs / relative
+            if library.is_file():
+                disk.add(library.resolve(), relative)
         disk.add(assets / "measure", "bin/measure")
         for label, binary in programs:
             disk.add(binary, "programs/" + label)

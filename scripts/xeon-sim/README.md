@@ -24,6 +24,8 @@ Alternatively, pass a Linux x86-64 cross compiler to `prepare.py --cc` and suppl
 
 ## Compare runs
 
+For comparisons with the earlier Arrow-based submissions, pass an exported image from commit `1018e64` using `--rootfs`. It includes the libraries required by those binaries. The standalone writer uses the standard Debian runtime.
+
 Point `--data` at the directory containing the organizer's manifest and CSV folders. Each output directory must be new. By default the runner uses the AVX-512 executable in the exported score image. For a comparison, both programs receive the same data, UID, libraries and guest settings. The runner reverses their order on every second repetition. Each run uses a fresh process within the same guest.
 
 ```sh

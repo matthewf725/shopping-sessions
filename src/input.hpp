@@ -207,6 +207,37 @@ inline uint64_t quote_parity(uint64_t q) {
 // Index a tile with aligned-in-stream, non-overlapping 64-byte scans. Quote
 // parity must be even at every separator, and a quote must touch a field edge.
 // A violation certifies a bad physical line. Retain every fully indexed line before it.
+template<class Sink>
+inline size_t scan_csv_tile(const char* data, size_t length, Sink& sink) {
+    uint64_t carry = 0, starts_field = 1;
+    for (size_t offset = 0; offset < length; offset += 64) {
+        size_t left = length - offset;
+        Marks m;
+        if (left >= 64) m = scan64(data + offset);
+        else {
+            alignas(64) char tail[64]{};
+            memcpy(tail, data + offset, left);
+            m = scan64(tail);
+        }
+        uint64_t ends = m.commas | m.lines;
+        if (m.quotes || carry) {
+            uint64_t next_end = left > 64 && (data[offset + 64] == ',' || data[offset + 64] == '\n');
+            uint64_t adjacent = (ends << 1) | starts_field | (ends >> 1) | (next_end << 63);
+            uint64_t parity = quote_parity(m.quotes) ^ carry;
+            uint64_t errors = (m.quotes & ~adjacent) | (parity & ends);
+            if (errors) {
+                uint64_t before = (errors & -errors) - 1;
+                sink.append_separators(offset, ends & before, m.lines & before);
+                return offset + std::countr_zero(errors);
+            }
+            carry = uint64_t(0) - (parity >> 63);
+        }
+        starts_field = ends >> 63;
+        sink.append_separators(offset, ends, m.lines);
+    }
+    return length;
+}
+
 template<size_t N>
 struct CsvTile {
     static constexpr unsigned target = 8192, slack = 192;
@@ -235,33 +266,7 @@ struct CsvTile {
     size_t index(const char* data, size_t length) {
         lines = comma_count = previous_count = 0;
         prefix[0] = 0;
-        uint64_t carry = 0, starts_field = 1;
-        for (size_t offset = 0; offset < length; offset += 64) {
-            size_t left = length - offset;
-            Marks m;
-            if (left >= 64) m = scan64(data + offset);
-            else {
-                alignas(64) char tail[64]{};
-                memcpy(tail, data + offset, left);
-                m = scan64(tail);
-            }
-            uint64_t ends = m.commas | m.lines;
-            if (m.quotes || carry) {
-                uint64_t next_end = left > 64 && (data[offset + 64] == ',' || data[offset + 64] == '\n');
-                uint64_t adjacent = (ends << 1) | starts_field | (ends >> 1) | (next_end << 63);
-                uint64_t parity = quote_parity(m.quotes) ^ carry;
-                uint64_t errors = (m.quotes & ~adjacent) | (parity & ends);
-                if (errors) {
-                    uint64_t before = (errors & -errors) - 1;
-                    append_separators(offset, ends & before, m.lines & before);
-                    return offset + std::countr_zero(errors);
-                }
-                carry = uint64_t(0) - (parity >> 63);
-            }
-            starts_field = ends >> 63;
-            append_separators(offset, ends, m.lines);
-        }
-        return length;
+        return scan_csv_tile(data, length, *this);
     }
     uint64_t commas_from(unsigned pos) const {
         unsigned w = pos >> 6, shift = pos & 63;
@@ -358,6 +363,75 @@ struct CsvTile {
     }
 };
 
+#if defined(__AVX512BW__)
+// Store every separator's byte offset. A valid row then occupies exactly N
+// consecutive slots, regardless of quoted fields, length, or timestamp form.
+template<size_t N>
+struct OffsetTile {
+    static constexpr unsigned target = CsvTile<N>::target;
+    static constexpr unsigned slack = CsvTile<N>::slack;
+    std::array<uint32_t, target + slack + 1> offsets;
+    std::array<uint16_t, (target + slack) / N + 1> rows;
+    unsigned count, lines, previous_stop, available;
+
+    void append_separators(size_t offset, uint64_t ends, uint64_t newlines) {
+        const auto lanes = _mm512_setr_epi32(0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15);
+        const auto positions = _mm512_add_epi32(lanes, _mm512_set1_epi32(int(offset)));
+        auto* dest = offsets.data() + count + 1;
+        _mm512_mask_compressstoreu_epi32(dest, __mmask16(ends), positions);
+        const auto step = _mm512_set1_epi32(16);
+        _mm512_mask_compressstoreu_epi32(dest + std::popcount(uint16_t(ends)), __mmask16(ends >> 16),
+                                         _mm512_add_epi32(positions, step));
+        _mm512_mask_compressstoreu_epi32(dest + std::popcount(uint32_t(ends)), __mmask16(ends >> 32),
+                                         _mm512_add_epi32(positions, _mm512_set1_epi32(32)));
+        _mm512_mask_compressstoreu_epi32(dest + std::popcount(ends & 0xffffffffffffULL), __mmask16(ends >> 48),
+                                         _mm512_add_epi32(positions, _mm512_set1_epi32(48)));
+        for (uint64_t bits = newlines; bits; bits &= bits - 1) {
+            auto bit = bits & -bits;
+            unsigned stop = count + std::popcount(ends & (bit - 1)) + 1;
+            if (stop - previous_stop == N) rows[lines++] = uint16_t(previous_stop);
+            previous_stop = stop;
+        }
+        count += std::popcount(ends);
+    }
+    size_t index(const char* data, size_t length) {
+        available = unsigned(length);
+        count = lines = previous_stop = 0;
+        offsets[0] = UINT32_MAX;
+        return scan_csv_tile(data, length, *this);
+    }
+    template<class F, class Project>
+    void visit(const char* data, F& handle, Project& project) const {
+        auto one = [&](unsigned i) {
+            const uint32_t* cuts = offsets.data() + rows[i];
+            auto text = [&](size_t column) {
+                const char* first = data + uint32_t(cuts[column] + 1);
+                return CsvTile<N>::field(first, data + cuts[column + 1]);
+            };
+            if constexpr (std::is_same_v<Project, std::nullptr_t>) {
+                std::array<Text, N> fields;
+                for (size_t j = 0; j < N; ++j) fields[j] = text(j);
+                handle(fields);
+            } else {
+                static_assert(N == 7);
+                unsigned product = cuts[5] + 1;
+                bool has_product = data[product] != ',' && !(data[product] == '"' && data[product + 1] == '"');
+                project(text(0), text(1), text(2), text(3), text(4), has_product,
+                        [&] { return std::pair{text(5), text(6)}; });
+            }
+        };
+        unsigned i = 0;
+        if constexpr (requires { project.batch(data, offsets.data(), rows.data()); }) {
+            for (; i + 8 <= lines && offsets[rows[i + 7] + N] + 40 <= available; i += 8) {
+                unsigned pending = unsigned(~project.batch(data, offsets.data(), rows.data() + i)) & 255;
+                for (; pending; pending &= pending - 1) one(i + std::countr_zero(pending));
+            }
+        }
+        for (; i < lines; ++i) one(i);
+    }
+};
+#endif
+
 inline const char* last_complete_line(const char* first, const char* stop) {
     while (stop - first >= 64) {
         stop -= 64;
@@ -385,7 +459,11 @@ void read_rows(Chunk chunk, F&& handle, Project project = nullptr) {
         if (nl) end = nl + 1;
     }
 #if defined(__SSE2__) || defined(__ARM_NEON)
+#if defined(__AVX512BW__)
+    OffsetTile<N> tile;
+#else
     CsvTile<N> tile;
+#endif
     while (row < end) {
         const char* stop = end;
         if (size_t(end - row) > CsvTile<N>::target) {
@@ -566,6 +644,7 @@ public:
 inline int32_t utc_day(Time t) { return int32_t(t / day_ms - (t % day_ms < 0)); }
 
 struct Window {
+    friend struct EventLanes;
     Clock clock;
     Time start, end;
     struct Arrival {
