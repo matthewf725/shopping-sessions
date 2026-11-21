@@ -33,6 +33,8 @@ using OwnedEvent = Owned<PackedEvent>;
 using OwnedClick = Owned<Click>;
 struct Worker {
     uint32_t number;
+    TimePool frozen_versions;
+    TimeBuilder time_builder;
     std::vector<Detail> details;
     ShardedBlocks<RawEvent, partitions> parsed;
     std::array<std::vector<Segment>, partitions> segments;
@@ -41,8 +43,8 @@ struct Worker {
     std::vector<UserDay> days;
     CampaignDays campaigns;
     Shopper shopper;
-    Worker(uint32_t index, const Window& w, const Dimensions& d, const Keys& click_keys)
-        : number(index), campaigns(w, d.names.size()), shopper(w, d, click_keys) {}
+    Worker(uint32_t index, const Window &w, const Dimensions &d, const Keys &click_keys)
+        : number(index), time_builder(w), campaigns(w, d.names.size()), shopper(w, d, click_keys) {}
 };
 
 template<class F> void parallel(size_t n, size_t jobs, F fn) {
@@ -373,6 +375,11 @@ struct Pipeline {
             Key canonical = people.linked_name(g.key);
             Segment seg{g.events != e0 ? ev.data() + e0 : nullptr, g.clicks != c0 ? ck.data() + c0 : nullptr,
                         uint32_t(g.events - e0), uint32_t(g.clicks - c0), canonical};
+            constexpr uint32_t freeze_threshold = 32;
+            if (canonical && seg.n >= freeze_threshold && dst.time_builder.supports()) {
+                seg.root = dst.time_builder.freeze(dst.frozen_versions, seg.events, seg.n, window.start);
+                seg.n = 0;
+            }
             if (canonical)
                 dst.segments[partition(canonical)].push_back(seg);
             else

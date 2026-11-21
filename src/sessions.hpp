@@ -5,6 +5,9 @@ namespace shop {
 constexpr Time gap = 30 * 60 * 1000;
 struct Event { Time ts; uint32_t price, category; };
 struct Click { Time ts; Key id; uint32_t campaign; };
+} // namespace shop
+#include "persistent.hpp"
+namespace shop {
 // A range of observations for one raw user. Linked aliases share a chain.
 struct Segment {
     const Event* events;
@@ -12,6 +15,7 @@ struct Segment {
     uint32_t n, m;
     Key name;
     Segment* next = nullptr;
+    const TimeNode *root = nullptr;
 };
 struct UserDay { Key person; int32_t day, sessions, events; uint32_t top; int64_t revenue; };
 struct Credits { int64_t sessions{}, purchasing{}, revenue{}; };
@@ -93,6 +97,17 @@ class Shopper {
     struct AssistRange { size_t first_session = SIZE_MAX; Time latest_click = invalid_time; };
     static constexpr uint32_t none = UINT32_MAX;
     Time origin_;
+    TimePool merged_versions_;
+    TimeBuilder residual_builder_;
+    std::vector<const PurchaseBag *> bag_stack_;
+    template <class Take> void components(const TimeNode *n, Take &take) {
+        if (!n)
+            return;
+        components(n->left, take);
+        const auto &span = n->span;
+        take(Bucket{origin_ + span.first, origin_ + span.last, span.count, none}, span.purchases);
+        components(n->right, take);
+    }
     const Keys& click_keys_;
     // These workspaces are reused across people. Clear only touched cells, categories and campaigns.
     std::vector<Bucket> bins_;
@@ -184,14 +199,15 @@ class Shopper {
             }
         }
     }
-    void form_sessions(Key person, std::vector<UserDay>& users) {
+    void form_sessions(Key person, std::vector<UserDay> &users, const TimeNode *root = nullptr) {
         session_days_.clear();
         Time last = invalid_time;
-        auto take = [&](const Bucket& b) {
+        auto take = [&](const Bucket &b, const PurchaseBag *bag = nullptr) {
             if (last == invalid_time || b.first - last > gap) {
                 int32_t day = utc_day(b.first);
                 if (sessions_.empty() || sessions_.back().day != day) {
-                    if (!sessions_.empty()) session_days_.push_back({sessions_.back().day, uint32_t(sessions_.size())});
+                    if (!sessions_.empty())
+                        session_days_.push_back({sessions_.back().day, uint32_t(sessions_.size())});
                     clear_categories();
                     users.push_back({person, day, 0, 0, 0, 0});
                 }
@@ -205,18 +221,45 @@ class Shopper {
             last = b.last;
             auto& daily = users.back();
             daily.events += b.events;
-            for (uint32_t i = b.purchases; i != none; i = purchases_[i].next) {
-                const auto& p = purchases_[i];
-                auto& sum = category_sums_[p.category];
-                if (sum == 0) categories_used_.push_back(p.category);
-                sum += p.price;
-                // Category numbers are assigned in byte-wise name order.
-                if (sum > category_sums_[daily.top] || (sum == category_sums_[daily.top] && p.category < daily.top)) daily.top = p.category;
-                daily.revenue += p.price;
-                sessions_.back().revenue += p.price;
+            auto account = [&](uint32_t price, uint32_t category) {
+                auto &sum = category_sums_[category];
+                if (!sum)
+                    categories_used_.push_back(category);
+                sum += price;
+                if (sum > category_sums_[daily.top] ||
+                    (sum == category_sums_[daily.top] && category < daily.top))
+                    daily.top = category;
+                daily.revenue += price;
+                sessions_.back().revenue += price;
+            };
+            for (uint32_t i = b.purchases; i != none; i = purchases_[i].next)
+                account(purchases_[i].price, purchases_[i].category);
+            if (bag) {
+                bag_stack_.push_back(bag);
+                while (!bag_stack_.empty()) {
+                    auto *item = bag_stack_.back();
+                    bag_stack_.pop_back();
+                    while (item) {
+                        if (item->price)
+                            account(item->price, item->category);
+                        if (item->right)
+                            bag_stack_.push_back(item->right);
+                        item = item->left;
+                    }
+                }
             }
         };
-        if (bins_.empty()) {
+        if (root) {
+            first_word_ = (root->first / uint32_t(gap)) >> 6;
+            last_word_ = (root->last / uint32_t(gap)) >> 6;
+            std::fill(start_bits_.begin() + first_word_, start_bits_.begin() + last_word_ + 1, 0);
+            components(root, take);
+            uint32_t starts = 0;
+            for (size_t i = first_word_; i <= last_word_; ++i) {
+                start_rank_[i] = starts;
+                starts += std::popcount(start_bits_[i]);
+            }
+        } else if (bins_.empty()) {
             radix_cells(order_, radix_scratch_);
             for (auto pos : order_) take(sparse_bins_.at(pos));
             order_.clear();
@@ -301,30 +344,43 @@ class Shopper {
         }
     }
 public:
-    Shopper(const Window& w, const Dimensions& d, const Keys& click_keys)
-        : origin_(w.start), click_keys_(click_keys), category_sums_(d.categories.size()+1), campaign_count_(d.names.size()) {
-        size_t weeks = size_t((w.end - w.start - 1) / week_ms) + 2;
-        if (weeks <= 1'000'000 / campaign_count_) coverage_.resize(weeks * campaign_count_);
-        size_t n = size_t((w.end - w.start - 1) / gap + 1);
-        if (n <= 65536) {
-            bins_.resize(n);
-            occupied_.resize((n+63)/64);
-            refined_.resize(occupied_.size());
-            start_bits_.resize(occupied_.size());
-            start_rank_.resize(occupied_.size());
-        }
-    }
+  Shopper(const Window &w, const Dimensions &d, const Keys &click_keys)
+      : origin_(w.start), residual_builder_(w), click_keys_(click_keys),
+        category_sums_(d.categories.size() + 1), campaign_count_(d.names.size()) {
+      size_t weeks = size_t((w.end - w.start - 1) / week_ms) + 2;
+      if (weeks <= 1'000'000 / campaign_count_)
+          coverage_.resize(weeks * campaign_count_);
+      size_t n = size_t((w.end - w.start - 1) / gap + 1);
+      if (n <= 65536) {
+          bins_.resize(n);
+          occupied_.resize((n + 63) / 64);
+          refined_.resize(occupied_.size());
+          start_bits_.resize(occupied_.size());
+          start_rank_.resize(occupied_.size());
+      }
+  }
     void run(Key person, const Segment* chain, std::vector<UserDay>& users, CampaignDays& campaigns) {
         sessions_.clear();
         first_word_ = occupied_.size();
         last_word_ = 0;
-        bool has_events = false;
-        for (auto seg = chain; seg; seg = seg->next) if (seg->n) {
-            collect(seg->events, seg->n);
-            has_events = true;
-        }
-        if (!has_events) return;
-        form_sessions(person, users);
+        const TimeNode *root = nullptr;
+        merged_versions_.rewind();
+        for (auto *seg = chain; seg; seg = seg->next)
+            if (seg->root)
+                root = merged_versions_.meld(root, seg->root);
+        bool has_events = root != nullptr;
+        for (auto *seg = chain; seg; seg = seg->next)
+            if (seg->n) {
+                if (root)
+                    root = merged_versions_.meld(
+                        root, residual_builder_.freeze(merged_versions_, seg->events, seg->n, origin_));
+                else
+                    collect(seg->events, seg->n);
+                has_events = true;
+            }
+        if (!has_events)
+            return;
+        form_sessions(person, users, root);
         attribute(chain, campaigns);
     }
 };

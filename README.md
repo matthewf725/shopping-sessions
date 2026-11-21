@@ -12,6 +12,14 @@ A C++20 pipeline for the [Builders Shopping Sessions track](https://www.joinbuil
 
 For the 14-day input window, each event takes expected constant work. The allowed click dates occupy three seven-day buckets including the pre-window lookback. Given `c` clicks, `b` occupied shopper/campaign/week groups and `d` covered group/day intersections after clipping, assist aggregation takes `O(c + b + d)` work. Shuffling the rows preserves the result.
 
+### Persistent interval tree experiment
+
+This branch freezes linked aliases with at least 32 events into immutable search trees. A node holds one complete session interval and caches the first timestamp, last timestamp, event count and purchase list for its subtree. When a connected interval spans another history, the merge can take that entire history in one operation. Otherwise it splits by interval endpoints, retaining immutable subtrees away from the boundary. Reading the resulting intervals in order supplies the session starts for campaign attribution. The initial CSV decode and construction of the alias histories are part of the measured runtime.
+
+In a constructed case a single bridging history joined 1,024 separated intervals with one new interval node. Both input versions were still queryable. A further 3,072 randomized merges agreed with a chronological reference on endpoints, event counts and revenue per category. Run the version-preservation test with `c++ -O2 -std=c++20 -Isrc tests/persistent_sessions.cpp -o /tmp/check-persistent && /tmp/check-persistent /path/to/input/manifest.json`.
+
+On an independent 2M-event, 500k-click input, the tree and the ordinary session builder produced identical user and campaign tables. Across two alternating local Linux AVX-512 simulator runs, the session and attribution stage took 31.62 ms of guest time with the tree and 17.27 ms with the ordinary builder. Whole-process simulated ticks increased 18.6%. The tree also passed all 36 organizer fixtures. The scoring branch retains the faster session builder.
+
 ## Verification
 
 `scripts/bench.sh 20000000 19 3` builds the image, runs the organizers' 36 fixtures and exact million-event comparison, then times three fresh containers on a generated practice-size input. Pass `60000000` for final size. The script uses the organizers' public Rust generator and checker, and requires Linux, Docker, Cargo, Python with Polars, curl and unzip. The default limits are eight vCPUs and 24 GB. Set `CPUSET` to the assigned logical CPU list on an N2 host to pin the run. Reported durations use Docker’s container start and exit timestamps.
