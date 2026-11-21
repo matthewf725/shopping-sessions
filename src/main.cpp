@@ -144,11 +144,19 @@ struct Pipeline {
             // Keep invalid copies by event ID so the earliest ingestion still wins.
             store_event(w, id, valid ? users.encode(person) : 0, ts, arrival.order, price, category);
         };
-#if defined(__AVX512BW__) && defined(__AVX512DQ__) && defined(__AVX512VL__)
-        auto accelerate = [&](const char* data, const uint32_t* offsets, const uint16_t* rows) {
-            return EventLanes::run(window, data, offsets, rows, [&](Key id, Key person, uint64_t packed) {
+#if defined(__AVX512BW__) && defined(__AVX512DQ__) && defined(__AVX512VL__) && defined(__AVX512CD__)
+        auto accelerate = [&](const char *data, const uint32_t *offsets, const uint16_t *rows,
+                              unsigned active = 255) {
+            auto append = [&](Key id, Key person, uint64_t packed) {
                 w.parsed.append(hash_partition(id), {id, person, {uint32_t(packed), uint32_t(packed >> 32)}});
-            });
+            };
+            auto eight = [&](__m512i ids, __m512i people, __m512i values, unsigned active) {
+                auto shards = _mm512_srli_epi64(ids, 64 - partition_bits);
+                const __m512i cols[] = {ids, people, values};
+                w.parsed.append_lanes(shards, active, cols,
+                                      [&](unsigned i, const auto &v) { append(v[0][i], v[1][i], v[2][i]); });
+            };
+            return EventLanes::run(window, data, offsets, rows, eight, active);
         };
         auto projection = BatchProjection{consume, accelerate};
 #else
@@ -168,13 +176,15 @@ struct Pipeline {
             Key raw_user = users.encode(f[1]);
             w.clicks.append(partition(raw_user), {raw_user, {ts, click_keys.encode(f[0]), campaign}});
         };
-#if defined(__AVX512BW__) && defined(__AVX512DQ__) && defined(__AVX512VL__)
-        auto accelerate = [&](const char* data, const uint32_t* offsets, const uint16_t* rows) {
-            return ClickLanes::parse(window, dim.campaigns, data, offsets, rows,
-                                     [&](uint64_t hash, Key person, Key id, Time time, uint32_t campaign) {
-                                         w.clicks.append(hash_partition(hash),
-                                                         {person, {time, id, campaign}});
-                                     });
+#if defined(__AVX512BW__) && defined(__AVX512DQ__) && defined(__AVX512VL__) && defined(__AVX512CD__)
+        auto accelerate = [&](const char *data, const uint32_t *offsets, const uint16_t *rows,
+                              unsigned active = 255) {
+            return ClickLanes::parse(
+                window, dim.campaigns, data, offsets, rows,
+                [&](uint64_t hash, Key person, Key id, Time time, uint32_t campaign) {
+                    w.clicks.append(hash_partition(hash), {person, {time, id, campaign}});
+                },
+                active);
         };
         read_rows<4>(chunk, consume, BatchProjection{consume, accelerate});
 #else
@@ -183,6 +193,28 @@ struct Pipeline {
     }
     void read(const fs::path& data) {
         CsvFiles ev(data / "events"), ck(data / "clicks"), links(data / "links");
+        // File sizes only estimate capacity. Vectors grow normally for any distribution.
+        size_t per_worker = ev.bytes / workers.size();
+        auto preallocate = [](auto &rows, size_t estimate) {
+            if (!estimate)
+                return;
+            rows.reserve(estimate);
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+            uintptr_t start = reinterpret_cast<uintptr_t>(rows.data());
+            uintptr_t end =
+                start + rows.capacity() * sizeof(typename std::decay_t<decltype(rows)>::value_type);
+            auto page_size = static_cast<uintptr_t>(sysconf(_SC_PAGESIZE));
+            auto page_mask = page_size - 1;
+            uintptr_t aligned = (start + page_mask) & ~page_mask;
+            end &= ~page_mask;
+            if (end > aligned)
+                madvise(reinterpret_cast<void *>(aligned), end - aligned, MADV_HUGEPAGE);
+#endif
+        };
+        for (auto &w : workers) {
+            preallocate(w.days, per_worker / 600);
+            preallocate(w.details, per_worker / 1600);
+        }
         size_t click_start = 1 + ev.chunks.size();
         parallel(workers.size(), click_start + ck.chunks.size(), [&](size_t wi, size_t job) {
             if (job == 0) people.build(links, users);
@@ -270,13 +302,25 @@ struct Pipeline {
                     auto data = _mm512_i64gather_epi64(_mm512_srli_epi64(slot, 5), filter.data(), 8);
                     auto bits = _mm512_sllv_epi64(_mm512_set1_epi64(2), _mm512_slli_epi64(slot & low, 1));
                     unsigned hit = _mm512_test_epi64_mask(data, bits);
-                    for (unsigned j = 0; j < 8; ++j) {
-                        auto& row = rows[i + j];
-                        if (hit & (1u << j))
-                            repeat(row);
-                        else
-                            emit(row);
-                    }
+                    const auto *mem = reinterpret_cast<const char *>(rows.data() + i);
+                    const auto a = _mm512_loadu_si512(mem), b = _mm512_loadu_si512(mem + 64),
+                               c = _mm512_loadu_si512(mem + 128);
+                    auto names = _mm512_permutex2var_epi64(a, _mm512_setr_epi64(1, 4, 7, 10, 13, 0, 0, 0), b);
+                    names = _mm512_mask_permutexvar_epi64(names, 0xe0,
+                                                          _mm512_setr_epi64(0, 0, 0, 0, 0, 0, 3, 6), c);
+                    auto values =
+                        _mm512_permutex2var_epi64(a, _mm512_setr_epi64(2, 5, 8, 11, 14, 0, 0, 0), b);
+                    values = _mm512_mask_permutexvar_epi64(values, 0xe0,
+                                                           _mm512_setr_epi64(0, 0, 0, 0, 0, 1, 4, 7), c);
+                    auto h = names ^ _mm512_srli_epi64(names, 32);
+                    h = _mm512_mullo_epi64(h, _mm512_set1_epi64(0xd6e8feb86659fd93ULL));
+                    h ^= _mm512_srli_epi64(h, 32);
+                    const __m512i cols[] = {names, values};
+                    unsigned active = (255 ^ hit) & _mm512_test_epi64_mask(names, names);
+                    dst.events.append_lanes(_mm512_srli_epi64(h, 64 - partition_bits), active, cols,
+                                            [&](unsigned j, const auto &) { emit(rows[i + j]); });
+                    for (; hit; hit &= hit - 1)
+                        repeat(rows[i + std::countr_zero(hit)]);
                 }
 #endif
                 for (; i < rows.size(); ++i) {
@@ -356,10 +400,60 @@ struct Pipeline {
         // shopper pass, so joining aliases moves only range descriptors.
         auto* ev = dst.parsed.allocate_range<Event>(en);
         auto* ck = dst.parsed.allocate_range<Click>(cn);
+#if defined(__AVX512CD__)
+        // Each packed event carries a window offset or an index into its worker's detail array.
+        // The first lane for each group reserves a slot. Other lanes for that group follow it.
+        std::array<const Detail *, 64> details;
+        for (size_t wi = 0; wi < workers.size(); ++wi)
+            details[wi] = workers[wi].details.data();
+        const auto even = _mm512_setr_epi64(0, 2, 4, 6, 8, 10, 12, 14);
+        const auto odd = _mm512_setr_epi64(1, 3, 5, 7, 9, 11, 13, 15);
+        const auto zero = _mm512_setzero_si512(), one = _mm512_set1_epi64(1);
+#endif
         for (auto& w : workers) {
             w.events.visit(p, [&](auto rows) {
-                for (auto& e : rows)
+                size_t i = 0;
+#if defined(__AVX512CD__)
+                auto *group_base = reinterpret_cast<char *>(primary.data());
+                auto base = _mm512_set1_epi64(reinterpret_cast<uintptr_t>(group_base));
+                for (; i + 8 <= rows.size(); i += 8) {
+                    auto a = _mm512_loadu_si512(rows.data() + i), b = _mm512_loadu_si512(rows.data() + i + 4);
+                    auto groups = _mm512_permutex2var_epi64(a, even, b);
+                    auto value = _mm512_permutex2var_epi64(a, odd, b);
+                    auto offsets = _mm512_sub_epi64(groups, base);
+                    auto where = _mm512_i64gather_epi64(offsets, group_base + offsetof(Group, events), 1);
+                    auto when = value & _mm512_set1_epi64(UINT32_MAX);
+                    auto times = _mm512_add_epi64(when, _mm512_set1_epi64(window.start));
+                    auto money = zero;
+                    unsigned fast = _mm512_cmpeq_epi64_mask(_mm512_conflict_epi64(groups), zero);
+                    unsigned tagged = _mm512_cmp_epi64_mask(value, zero, _MM_CMPINT_LT);
+                    if (unsigned extra = tagged & fast) {
+                        static_assert(sizeof(Detail) == 24 && offsetof(Detail, event) == 8);
+                        auto worker = _mm512_srli_epi64(value, 32) & _mm512_set1_epi64(detailed - 1);
+                        auto addr =
+                            _mm512_mask_i64gather_epi64(zero, __mmask8(extra), worker, details.data(), 8);
+                        addr = _mm512_add_epi64(
+                            addr, _mm512_slli_epi64(_mm512_add_epi64(when, _mm512_slli_epi64(when, 1)), 3));
+                        addr = _mm512_sub_epi64(addr, base);
+                        times = _mm512_mask_i64gather_epi64(times, __mmask8(extra), addr, group_base + 8, 1);
+                        money = _mm512_mask_i64gather_epi64(money, __mmask8(extra), addr, group_base + 16, 1);
+                    }
+                    _mm512_mask_i64scatter_epi64(group_base + offsetof(Group, events), __mmask8(fast),
+                                                 offsets, _mm512_add_epi64(where, one), 1);
+                    auto dest = _mm512_slli_epi64(where, 1);
+                    _mm512_mask_i64scatter_epi64(ev, __mmask8(fast), dest, times, 8);
+                    _mm512_mask_i64scatter_epi64(reinterpret_cast<char *>(ev) + 8, __mmask8(fast), dest,
+                                                 money, 8);
+                    for (unsigned pending = 255 ^ fast; pending; pending &= pending - 1) {
+                        auto &e = rows[i + std::countr_zero(pending)];
+                        ev[e.group->events++] = unpack(e.value);
+                    }
+                }
+#endif
+                for (; i < rows.size(); ++i) {
+                    auto &e = rows[i];
                     ev[e.group->events++] = unpack(e.value);
+                }
             });
             w.clicks.visit(p, [&](auto rows) {
                 for (auto& c : rows)

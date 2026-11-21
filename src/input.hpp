@@ -290,7 +290,12 @@ inline size_t scan_csv_tile(const char* data, size_t length, Sink& sink) {
 
 template<size_t N>
 struct CsvTile {
+#if defined(__AVX512BW__)
+    static constexpr unsigned target = 32768, slack = 192;
+#else
     static constexpr unsigned target = 8192, slack = 192;
+#endif
+    static_assert(target + slack < UINT16_MAX);
     static constexpr unsigned words = (target + slack + 63) / 64;
     static constexpr uint16_t wrong_columns = 0x8000;
     std::array<uint16_t, target + slack> line_ends;
@@ -477,6 +482,22 @@ struct OffsetTile {
                 for (; pending; pending &= pending - 1) one(i + std::countr_zero(pending));
             }
         }
+        if constexpr (requires { project.batch(data, offsets.data(), rows.data(), unsigned(1)); }) {
+            unsigned safe = 0;
+            while (i + safe < lines && safe < 8 && offsets[rows[i + safe] + N] + 40 <= available)
+                ++safe;
+            // Inactive lanes repeat an in-bounds row. Only active lanes may emit.
+            if (safe >= 2) {
+                alignas(16) uint16_t padded[8];
+                for (unsigned j = 0; j < 8; ++j)
+                    padded[j] = rows[i + (j < safe ? j : 0)];
+                unsigned active = (1u << safe) - 1;
+                unsigned pending = active & ~unsigned(project.batch(data, offsets.data(), padded, active));
+                for (; pending; pending &= pending - 1)
+                    one(i + std::countr_zero(pending));
+                i += safe;
+            }
+        }
         for (; i < lines; ++i) one(i);
     }
 };
@@ -526,6 +547,9 @@ void read_rows(Chunk chunk, F&& handle, Project project = nullptr) {
             if (stop == row) break;
         }
         const char* witness = row + tile.index(row, stop - row);
+        // A vector load may cross a tile boundary while staying inside the mapping.
+        if constexpr (requires { tile.available; })
+            tile.available += unsigned(std::min<ptrdiff_t>(64, chunk.file_end - stop));
         tile.visit(row, handle, project);
         row = stop;
         if (witness < stop) {

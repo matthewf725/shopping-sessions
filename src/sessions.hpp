@@ -93,10 +93,11 @@ class Shopper {
     struct AssistRange { size_t first_session = SIZE_MAX; Time latest_click = invalid_time; };
     static constexpr uint32_t none = UINT32_MAX;
     Time origin_;
+    bool vector_window_ = false;
     const Keys& click_keys_;
     // These workspaces are reused across people. Clear only touched cells, categories and campaigns.
     std::vector<Bucket> bins_;
-    std::vector<uint64_t> occupied_, refined_, start_bits_;
+    std::vector<uint64_t> occupied_, start_bits_;
     std::vector<uint32_t> start_rank_;
     std::unordered_map<uint32_t, Bucket> sparse_bins_;
     std::vector<uint32_t> order_, radix_scratch_;
@@ -117,54 +118,72 @@ class Shopper {
         for (uint32_t c : categories_used_) category_sums_[c] = 0;
         categories_used_.clear();
     }
-    // A two-hour slot starts with one connected component. Any event inside
-    // that interval or within one gap of an endpoint belongs to it.
+    // The timestamps in a half-hour cell span at most one session gap.
     Bucket& dense_bucket(Time ts, uint32_t pos) {
         size_t word = pos >> 6;
-        uint32_t base = pos & ~uint32_t(3);
-        uint64_t group_bit = uint64_t(1) << (base & 63);
-        uint64_t& used = occupied_[word];
-        if (!(refined_[word] & group_bit)) {
-            auto& group = bins_[base];
-            if (!(used & group_bit)) {
-                used |= group_bit;
-                first_word_ = std::min(first_word_, word);
-                last_word_ = std::max(last_word_, word);
-                group = {ts, ts, 0, none};
-                return group;
-            }
-            if (ts >= group.first - gap && ts <= group.last + gap) {
-                group.first = std::min(ts, group.first);
-                group.last = std::max(ts, group.last);
-                return group;
-            }
-            // Keep the connected interval across its half-hour cells so a later
-            // event can bridge the gap. All its counts and purchases stay together.
-            Bucket previous = group;
-            uint32_t first = cell(previous.first), last = cell(previous.last);
-            refined_[word] |= group_bit;
-            used &= ~group_bit;
-            for (uint32_t cell_id = first; cell_id <= last; ++cell_id) {
-                Time edge = origin_ + cell_id * gap;
-                bins_[cell_id] = {std::max(edge, previous.first), std::min(edge + gap - 1, previous.last), 0, none};
-                used |= uint64_t(1) << (cell_id & 63);
-            }
-            bins_[first].events = previous.events;
-            bins_[first].purchases = previous.purchases;
-        }
-        uint64_t bit = uint64_t(1) << (pos & 63);
-        auto& b = bins_[pos];
-        if (used & bit) {
-            b.first = std::min(ts, b.first);
-            b.last = std::max(ts, b.last);
-        } else {
-            used |= bit;
-            b = {ts, ts, 0, none};
-        }
+        occupied_[word] |= uint64_t(1) << (pos & 63);
+        first_word_ = std::min(first_word_, word);
+        last_word_ = std::max(last_word_, word);
+        auto &b = bins_[pos];
+        b.first = std::min(b.first, ts);
+        b.last = std::max(b.last, ts);
         return b;
     }
     void collect(const Event* events, size_t count) {
-        for (size_t i = 0; i < count; ++i) {
+#if defined(__AVX512CD__)
+        size_t i = 0;
+        if (!bins_.empty() && vector_window_) {
+            const auto zero = _mm512_setzero_si512(), one = _mm512_set1_epi64(1);
+            // For a 32-bit window, x = delta / 64 is below 2^26. Rounding the
+            // reciprocal up contributes less than 1/28125, so the quotient is exact.
+            constexpr uint64_t magic = ((uint64_t(1) << 41) + 28124) / 28125;
+            for (; i + 8 <= count; i += 8) {
+                auto first = _mm512_loadu_si512(events + i);
+                auto second = _mm512_loadu_si512(events + i + 4);
+                auto times =
+                    _mm512_permutex2var_epi64(first, _mm512_setr_epi64(0, 2, 4, 6, 8, 10, 12, 14), second);
+                auto prices =
+                    _mm512_permutex2var_epi64(first, _mm512_setr_epi64(1, 3, 5, 7, 9, 11, 13, 15), second);
+                auto delta = _mm512_sub_epi64(times, _mm512_set1_epi64(origin_));
+                auto cell = _mm512_srli_epi64(
+                    _mm512_mul_epu32(_mm512_srli_epi64(delta, 6), _mm512_set1_epi64(magic)), 41);
+                auto index = _mm512_add_epi64(cell, _mm512_slli_epi64(cell, 1));
+                unsigned fast = _mm512_cmpeq_epi64_mask(_mm512_conflict_epi64(cell), zero) &
+                                _mm512_testn_epi64_mask(prices, _mm512_set1_epi64(0xffffffffu));
+                auto *base = reinterpret_cast<char *>(bins_.data());
+                auto low = _mm512_i64gather_epi64(index, base, 8);
+                auto high = _mm512_i64gather_epi64(index, base + 8, 8);
+                auto counts = _mm512_i64gather_epi64(index, base + 16, 8);
+                _mm512_mask_i64scatter_epi64(base, __mmask8(fast), index, _mm512_min_epi64(low, times), 8);
+                _mm512_mask_i64scatter_epi64(base + 8, __mmask8(fast), index, _mm512_max_epi64(high, times),
+                                             8);
+                _mm512_mask_i64scatter_epi64(base + 16, __mmask8(fast), index, _mm512_add_epi64(counts, one),
+                                             8);
+                alignas(64) uint64_t cells[8];
+                _mm512_store_si512(cells, cell);
+                for (unsigned j = 0; j < 8; ++j) {
+                    unsigned k = cells[j], word = k >> 6;
+                    occupied_[word] |= uint64_t(1) << (k & 63);
+                    first_word_ = std::min(size_t(word), first_word_);
+                    last_word_ = std::max(size_t(word), last_word_);
+                    if (!(fast & (1u << j))) {
+                        const auto &e = events[i + j];
+                        auto &b = bins_[k];
+                        ++b.events;
+                        b.first = std::min(b.first, e.ts);
+                        b.last = std::max(b.last, e.ts);
+                        if (e.price) {
+                            purchases_.push_back({e.price, e.category, b.purchases});
+                            b.purchases = purchases_.size() - 1;
+                        }
+                    }
+                }
+            }
+        }
+#else
+        size_t i = 0;
+#endif
+        for (; i < count; ++i) {
             const Event& e = events[i];
             uint32_t pos = cell(e.ts);
             Bucket* b;
@@ -229,10 +248,10 @@ class Shopper {
                 for (uint64_t mask = occupied_[w]; mask; mask &= mask - 1) {
                     uint32_t pos = uint32_t(64 * w + std::countr_zero(mask));
                     take(bins_[pos]);
+                    bins_[pos] = {INT64_MAX, INT64_MIN, 0, none};
                 }
                 starts += std::popcount(start_bits_[w]);
                 occupied_[w] = 0;
-                refined_[w] = 0;
             }
         }
         indexed_ = !bins_.empty();
@@ -303,13 +322,13 @@ class Shopper {
 public:
     Shopper(const Window& w, const Dimensions& d, const Keys& click_keys)
         : origin_(w.start), click_keys_(click_keys), category_sums_(d.categories.size()+1), campaign_count_(d.names.size()) {
+        vector_window_ = uint64_t(w.end - w.start - 1) <= UINT32_MAX;
         size_t weeks = size_t((w.end - w.start - 1) / week_ms) + 2;
         if (weeks <= 1'000'000 / campaign_count_) coverage_.resize(weeks * campaign_count_);
         size_t n = size_t((w.end - w.start - 1) / gap + 1);
         if (n <= 65536) {
-            bins_.resize(n);
+            bins_.resize(n, Bucket{INT64_MAX, INT64_MIN, 0, none});
             occupied_.resize((n+63)/64);
-            refined_.resize(occupied_.size());
             start_bits_.resize(occupied_.size());
             start_rank_.resize(occupied_.size());
         }

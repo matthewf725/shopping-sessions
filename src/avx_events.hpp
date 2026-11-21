@@ -81,8 +81,8 @@ struct EventLanes {
         return _mm512_add_epi64(_mm512_mul_epu32(groups, number(10000)), _mm512_srli_epi64(groups, 32));
     }
     template <class Store>
-    static M run(const Window& window, const char* data, const uint32_t* cuts, const uint16_t* rows,
-                 Store store) {
+    static M run(const Window &window, const char *data, const uint32_t *cuts, const uint16_t *rows,
+                 Store store, unsigned active = 255) {
         I indices = _mm256_cvtepu16_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(rows)));
         I boundaries[6];
         for (unsigned i = 0; i < 6; ++i)
@@ -136,24 +136,18 @@ struct EventLanes {
                 _mm512_cmp_epi64_mask(ts, number(window.end), _MM_CMPINT_LT);
         V when = _mm512_sub_epi64(ts, number(window.start));
         good &= _mm512_cmp_epu64_mask(when, number(UINT32_MAX), _MM_CMPINT_LE);
+        good &= active;
         V hk = event_key ^ _mm512_srli_epi64(event_key, 32);
         hk = _mm512_mullo_epi64(hk, number(0xd6e8feb86659fd93ULL));
         hk ^= _mm512_srli_epi64(hk, 32);
-        alignas(64) uint64_t ids[8], people[8], values[8];
-        _mm512_store_si512(ids, hk);
-        _mm512_store_si512(people, person);
-        _mm512_store_si512(values, _mm512_slli_epi64(order, 32) | when);
-        for (unsigned bits = good; bits; bits &= bits - 1) {
-            unsigned i = std::countr_zero(bits);
-            store(ids[i], people[i], values[i]);
-        }
+        store(hk, person, _mm512_slli_epi64(order, 32) | when, unsigned(good));
         return good;
     }
 };
 struct ClickLanes : EventLanes {
     template <class Store>
-    static M parse(const Window& window, const Catalog& catalog, const char* data, const uint32_t* cuts,
-                   const uint16_t* rows, Store store) {
+    static M parse(const Window &window, const Catalog &catalog, const char *data, const uint32_t *cuts,
+                   const uint16_t *rows, Store store, unsigned active = 255) {
         I index = _mm256_cvtepu16_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(rows)));
         I c[5];
         for (unsigned i = 0; i < 5; ++i)
@@ -205,6 +199,7 @@ struct ClickLanes : EventLanes {
         V ts = _mm512_mask_blend_epi64(iso, epoch_time, iso_time);
         good &= (iso | epoch) & _mm512_cmp_epi64_mask(ts, number(window.start - week_ms), _MM_CMPINT_GE) &
                 _mm512_cmp_epi64_mask(ts, number(window.end), _MM_CMPINT_LT);
+        good &= active;
         V hash = person ^ _mm512_srli_epi64(person, 32);
         hash = _mm512_mullo_epi64(hash, number(0xd6e8feb86659fd93ULL));
         hash ^= _mm512_srli_epi64(hash, 32);

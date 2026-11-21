@@ -249,6 +249,22 @@ def chunk_boundaries(data):
         for eid, price in [('e0000003e', 31), ('e0000041f', 47)]:
             f.write(f'{eid},ucollide0,1735689600123,2025-01-01T00:01:00Z,purchase,p1,999\n')
             f.write(f'{eid},ucollide0,1735689600123,{start},purchase,p1,{price}\n')
+    # End each file with a different number of vector lanes before a malformed line.
+    # Repeated shopper keys exercise reservations for multiple lanes in the same group.
+    click_header = 'click_id,user_id,campaign_id,ts\n'
+    for count in range(1, 16):
+        event_rows, click_rows = [], []
+        for lane in range(count):
+            person = f'u{count:02d}0000{lane % 2:02d}'
+            eid = f'e{count:02d}9100{lane:02d}'
+            cid = f'k{count:02d}9100{lane:02d}'
+            time = f'2025-01-01T00:{2 * lane:02d}:00Z'
+            kind = 'purchase' if lane % 3 == 0 else 'cart'
+            event_rows.append(f'{eid},{person},{time},{time},{kind},p1,{lane + 1}\n')
+            click_rows.append(f'{cid},{person},c_1,{time}\n')
+        padding = 'x' * 64 + '\n'
+        (data / 'events' / f'tail-{count}.csv').write_text(header + ''.join(event_rows) + padding)
+        (data / 'clicks' / f'tail-{count}.csv').write_text(click_header + ''.join(click_rows) + padding)
     with (data / 'clicks' / 'epochs.csv').open('w') as f:
         f.write('click_id,user_id,campaign_id,ts\n')
         epoch = '1735689600123'
