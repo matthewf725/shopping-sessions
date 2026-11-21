@@ -174,6 +174,13 @@ def adversarial(data, years):
                                 ('emonth', '2023-12-01T23:59:59Z', '2024-01-01T00:00:00Z')]:
         events.append((eid, 'u1234567', str(base), earlier, 'purchase', 'p1', '103'))
         events.append((eid, 'u12345670', str(base), later, 'view', 'p2', ''))
+    # Equal counts, extrema and mean timestamp, with different internal session gaps.
+    # A late-arriving bridge can also reconnect several half-hour cells after refinement.
+    for who, minutes in [('dense-slot', [0, 20, 40, 60]), ('split-slot', [0, 0, 60, 60]),
+                         ('bridged-slot', [0, 29, 57, 117, 87]), ('open-slot', [0, 29, 57, 118, 87])]:
+        for i, minute in enumerate(minutes):
+            ts = base + 2*DAY + minute*60_000
+            events.append((f'{who}-{i}', who, str(ts), iso(ts), 'purchase', 'p1', '101'))
     data_sets = {'events': ('event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents', events),
                  'clicks': ('click_id,user_id,campaign_id,ts', clicks), 'links': ('user_id_a,user_id_b', links)}
     for name, (header, rows) in data_sets.items():
@@ -201,6 +208,13 @@ def chunk_boundaries(data):
         pad = 'x' * (512 * 1024 + delta - len(header) - len(first))
         giant = f'e{i}c,u1,{start},{start},view,p1,' + 'x' * (2 * 512 * 1024 + 7)
         (data / 'events' / f'{i}.csv').write_text(header + first + pad + '\n' + giant + '\n' + tail)
+    # Move quote errors through vector boundaries, with a valid physical line on either side.
+    with (data / 'events' / 'quotes.csv').open('w') as f:
+        f.write(header)
+        for i in range(128):
+            f.write(f'egood{i},u1,{start},{start},purchase,p1,7\n')
+            f.write(f'ebadq{i},u1,{start},{start},view,' + 'x'*i + 'a"b,\n')
+            f.write(f'ebadend{i},u1,{start},{start},view,p1,"abc\n')
 
 
 def check(exe, data, output):

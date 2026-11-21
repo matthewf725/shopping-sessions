@@ -6,7 +6,7 @@ A C++20 pipeline for the [Builders Shopping Sessions track](https://www.joinbuil
 
 1. One worker builds the identity graph from the links while the other workers parse CSV chunks. The AVX-512BW build for Cascade Lake scans 64 bytes at a time, checks quote parity at separators and decodes the four date and time pairs in parallel. Event records usually take 24 bytes. Purchases and timestamps outside the compact range have an exact side record.
 2. Partition events by exact event ID and retain the earliest ingestion time, including invalid copies. A bitmap sends potential duplicates to an exact hash table. Group the winners and the valid clicks by raw user ID. Each distinct raw ID then needs one identity lookup. A linked shopper's event and click ranges stay in place. The session builder reads them through a list of ranges.
-3. Each event updates one half-hour bucket. All events within that bucket belong to one session. Join consecutive occupied buckets when the next bucket's first time is within 30 minutes of the previous bucket's last time. A bitmap visits populated buckets in time order. Very wide windows use four radix passes over occupied bucket numbers.
+3. After deduplication and identity linking, each two-hour slot for a shopper starts with one connected interval. An event inside it or within 30 minutes of either endpoint extends that interval. A farther event triggers refinement of just that slot into at most four half-hour cells. The previous interval retains its counts and purchases, and later events can bridge a gap. A bitmap visits the resulting intervals in time order and compares their endpoints across slot boundaries. Very wide windows use four radix passes over occupied half-hour cell numbers.
 4. Session starts are more than 30 minutes apart. A bitmap and prefix counts map a click's seven-day interval to a range of sessions. Keep the most recent click first eligible at each session, breaking ties by ID, then carry the winner forward until expiration. OR the eligible range into a campaign bitset to count each assist once. Identical click copies give identical winners and set the same bits.
 5. Workers write independent user Parquet files and reduce campaign totals. Apache Arrow's C++ Parquet writer (21.0.0) is the output library. The CSV scanner, deduplication, session construction and attribution code were written for this track.
 
@@ -40,3 +40,20 @@ These are medians from nine interleaved warm, fresh-process runs of each build o
 | --- | ---: | ---: | ---: | ---: |
 | 83 | 210.7 ms | 199.3 ms | 422.2 ms | 421.7 ms |
 | 157 | 194.7 ms | 193.0 ms | 410.3 ms | 409.0 ms |
+
+### Global structure across shuffled parts
+
+The generator assigns sessions to two-hour slots before shuffling the files. The pipeline checks connectivity using the timestamps actually received for each linked shopper. If the earliest and latest event in a slot are at most 30 minutes apart, all events in it are connected for every input order. Comparing the previous occupied slot's last time with the next one's first time always gives the exact gap between slots. Any missed session start must lie inside a slot whose span exceeds 30 minutes. [Organizer's generator](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/generator.zip)
+
+| 20M-event seed | Nonempty shopper–slot groups | Groups certified by the two endpoints | Groups requiring a closer look by this test | Additional starts inside those groups |
+| --- | ---: | ---: | ---: | ---: |
+| 211 | 3,465,787 | 3,449,752 | 16,035 | 7,955 |
+| 307 | 3,462,225 | 3,446,092 | 16,133 | 8,055 |
+
+Twelve interleaved warm runs per build on the eight-worker M4 Max gave median process times of 390.09 ms before and 390.08 ms after these changes on seed 211, and 385.17 ms before and 375.41 ms after on seed 307. The baseline was `04ec7ca`. An earlier nine-run comparison on seed 307 measured 392.09 ms before and 394.52 ms after. Both practice-size datasets produced exactly the same output rows as the baseline.
+
+The CSV reader also retains the complete lines preceding a quote error. On seed 211 the previous tile fallback sent 383,568 event rows to the strict reader after a vector quote check failed. The new check isolated 3,623 malformed physical lines and resumed at the next newline. Both readers accepted the same 21,425,622 syntactically valid event rows.
+
+The standalone `scripts/shape_index.cpp` indexes the two predicted row properties described above. It scans the event files once in filename order, counting physical data rows from zero and recording a file and byte offset for each exception. A query binary-searches the sorted list of exceptions and visits only the entries in the requested half-open range. With `H` exceptions in the index and `h` in the range, the query takes `O(log(1 + H) + h)` work. Building the index reads all the event bytes. On seed 211, 20,000 range queries checked against a row-by-row oracle needed at most 22 comparisons to locate their first candidate among 3,244,877 exceptions.
+
+Build the diagnostic with `c++ -O3 -std=c++20 -Isrc scripts/shape_index.cpp -o /tmp/shape-index`. Run `/tmp/shape-index /path/to/data` and enter pairs such as `1000 1250` on standard input. Each result gives the physical row number, part filename and byte offset. The timed pipeline processes all events directly.

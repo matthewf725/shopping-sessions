@@ -171,13 +171,22 @@ inline uint64_t quote_parity(uint64_t q) {
 
 // Index a tile with aligned-in-stream, non-overlapping 64-byte scans. Quote
 // parity must be even at every separator, and a quote must touch a field edge.
-// If either check fails, the strict reader recovers each physical line independently.
+// A violation certifies a bad physical line. Retain every fully indexed line before it.
 struct CsvTile {
     static constexpr size_t target = 8192;
     static constexpr size_t slack = 192;
     std::array<uint16_t, target + slack + 1> separator, line_end;
     size_t fields = 0, lines = 0;
-    bool index(const char* data, size_t length) {
+    void append_separators(size_t offset, uint64_t ends, uint64_t nl) {
+        for (; nl; nl &= nl - 1) {
+            uint64_t first = nl & -nl;
+            line_end[lines++] = uint16_t(fields + std::popcount(ends & (first | (first - 1))));
+        }
+        for (uint64_t bits = ends; bits; bits &= bits - 1)
+            separator[fields++] = uint16_t(offset + std::countr_zero(bits));
+    }
+    // The caller ends each tile at a newline. Return length on success or the first bad byte.
+    size_t index(const char* data, size_t length) {
         fields = lines = 0;
         uint64_t carry = 0, starts_field = 1;
         for (size_t offset = 0; offset < length; offset += 64) {
@@ -194,18 +203,18 @@ struct CsvTile {
                 uint64_t next_end = left > 64 && (data[offset + 64] == ',' || data[offset + 64] == '\n');
                 uint64_t adjacent = (ends << 1) | starts_field | (ends >> 1) | (next_end << 63);
                 uint64_t parity = quote_parity(m.quotes) ^ carry;
-                if ((m.quotes & ~adjacent) || (parity & ends)) return false;
+                uint64_t errors = (m.quotes & ~adjacent) | (parity & ends);
+                if (errors) {
+                    uint64_t before = (errors & -errors) - 1;
+                    append_separators(offset, ends & before, m.lines & before);
+                    return offset + std::countr_zero(errors);
+                }
                 carry = uint64_t(0) - (parity >> 63);
             }
             starts_field = ends >> 63;
-            for (uint64_t nl = m.lines; nl; nl &= nl - 1) {
-                uint64_t first = nl & -nl;
-                line_end[lines++] = uint16_t(fields + std::popcount(ends & (first | (first - 1))));
-            }
-            for (uint64_t bits = ends; bits; bits &= bits - 1)
-                separator[fields++] = uint16_t(offset + std::countr_zero(bits));
+            append_separators(offset, ends, m.lines);
         }
-        return !carry;
+        return length;
     }
 };
 #endif
@@ -234,10 +243,7 @@ void read_rows(Chunk chunk, F&& handle) {
             stop = nl + 1;
         }
         if (stop[-1] != '\n') break;
-        if (!tile.index(row, stop - row)) {
-            while (row < stop) row = scalar_row<N>(row, stop, handle);
-            continue;
-        }
+        const char* witness = row + tile.index(row, stop - row);
         size_t first = 0;
         unsigned start = 0;
         for (size_t line = 0; line < tile.lines; ++line) {
@@ -255,6 +261,11 @@ void read_rows(Chunk chunk, F&& handle) {
             first = next;
         }
         row = stop;
+        if (witness < stop) {
+            // Values cannot contain newlines. This tile ends at a newline, so
+            // the first one at or after the invalid byte is the end of its row.
+            row = static_cast<const char*>(memchr(witness, '\n', stop - witness)) + 1;
+        }
     }
 #endif
     while (row < end) row = scalar_row<N>(row, end, handle);

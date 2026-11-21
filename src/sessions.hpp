@@ -65,7 +65,7 @@ class Shopper {
     const Keys& click_keys_;
     // These workspaces are reused across people. Clear only touched cells, categories and campaigns.
     std::vector<Bucket> bins_;
-    std::vector<uint64_t> occupied_, start_bits_;
+    std::vector<uint64_t> occupied_, refined_, start_bits_;
     std::vector<uint32_t> start_rank_;
     std::unordered_map<uint32_t, Bucket> sparse_bins_;
     std::vector<uint32_t> order_, radix_scratch_;
@@ -85,28 +85,66 @@ class Shopper {
         for (uint32_t c : categories_used_) category_sums_[c] = 0;
         categories_used_.clear();
     }
+    // A two-hour slot starts with one connected component. Any event inside
+    // that interval or within one gap of an endpoint belongs to it.
+    Bucket& dense_bucket(Time ts, uint32_t pos) {
+        size_t word = pos >> 6;
+        uint32_t base = pos & ~uint32_t(3);
+        uint64_t group_bit = uint64_t(1) << (base & 63);
+        uint64_t& used = occupied_[word];
+        if (!(refined_[word] & group_bit)) {
+            auto& group = bins_[base];
+            if (!(used & group_bit)) {
+                used |= group_bit;
+                first_word_ = std::min(first_word_, word);
+                last_word_ = std::max(last_word_, word);
+                group = {ts, ts, 0, none};
+                return group;
+            }
+            if (ts >= group.first - gap && ts <= group.last + gap) {
+                group.first = std::min(ts, group.first);
+                group.last = std::max(ts, group.last);
+                return group;
+            }
+            // Keep the connected interval across its half-hour cells so a later
+            // event can bridge the gap. All its counts and purchases stay together.
+            Bucket previous = group;
+            uint32_t first = cell(previous.first), last = cell(previous.last);
+            refined_[word] |= group_bit;
+            used &= ~group_bit;
+            for (uint32_t cell_id = first; cell_id <= last; ++cell_id) {
+                Time edge = origin_ + cell_id * gap;
+                bins_[cell_id] = {std::max(edge, previous.first), std::min(edge + gap - 1, previous.last), 0, none};
+                used |= uint64_t(1) << (cell_id & 63);
+            }
+            bins_[first].events = previous.events;
+            bins_[first].purchases = previous.purchases;
+        }
+        uint64_t bit = uint64_t(1) << (pos & 63);
+        auto& b = bins_[pos];
+        if (used & bit) {
+            b.first = std::min(ts, b.first);
+            b.last = std::max(ts, b.last);
+        } else {
+            used |= bit;
+            b = {ts, ts, 0, none};
+        }
+        return b;
+    }
     void collect(const Event* events, size_t count) {
         for (size_t i = 0; i < count; ++i) {
             const Event& e = events[i];
             uint32_t pos = cell(e.ts);
             Bucket* b;
             if (!bins_.empty()) {
-                size_t w = pos >> 6;
-                uint64_t mask = uint64_t(1) << (pos & 63);
-                b = &bins_[pos];
-                if (!(occupied_[w] & mask)) {
-                    occupied_[w] |= mask;
-                    first_word_ = std::min(first_word_, w);
-                    last_word_ = std::max(last_word_, w);
-                    *b = {e.ts, e.ts, 0, none};
-                }
+                b = &dense_bucket(e.ts, pos);
             } else {
                 auto [it, added] = sparse_bins_.try_emplace(pos, Bucket{e.ts, e.ts, 0, none});
                 if (added) order_.push_back(pos);
                 b = &it->second;
+                b->first = std::min(b->first, e.ts);
+                b->last = std::max(b->last, e.ts);
             }
-            b->first = std::min(b->first, e.ts);
-            b->last = std::max(b->last, e.ts);
             ++b->events;
             if (e.price) {
                 purchases_.push_back({e.price, e.category, b->purchases});
@@ -116,7 +154,7 @@ class Shopper {
     }
     void form_sessions(Key person, std::vector<UserDay>& users) {
         Time last = invalid_time;
-        auto take = [&](uint32_t pos, const Bucket& b) {
+        auto take = [&](const Bucket& b) {
             if (last == invalid_time || b.first - last > gap) {
                 int32_t day = utc_day(b.first);
                 if (sessions_.empty() || sessions_.back().day != day) {
@@ -125,7 +163,10 @@ class Shopper {
                 }
                 ++users.back().sessions;
                 sessions_.push_back({b.first, 0, {invalid_time, 0, 0}, day});
-                if (!bins_.empty()) start_bits_[pos >> 6] |= uint64_t(1) << (pos & 63);
+                if (!bins_.empty()) {
+                    uint32_t start = cell(b.first);
+                    start_bits_[start >> 6] |= uint64_t(1) << (start & 63);
+                }
             }
             last = b.last;
             auto& daily = users.back();
@@ -143,7 +184,7 @@ class Shopper {
         };
         if (bins_.empty()) {
             radix_cells(order_, radix_scratch_);
-            for (auto pos : order_) take(pos, sparse_bins_.at(pos));
+            for (auto pos : order_) take(sparse_bins_.at(pos));
             order_.clear();
             sparse_bins_.clear();
         } else {
@@ -153,10 +194,11 @@ class Shopper {
                 start_rank_[w] = starts;
                 for (uint64_t mask = occupied_[w]; mask; mask &= mask - 1) {
                     uint32_t pos = uint32_t(64 * w + std::countr_zero(mask));
-                    take(pos, bins_[pos]);
+                    take(bins_[pos]);
                 }
                 starts += std::popcount(start_bits_[w]);
                 occupied_[w] = 0;
+                refined_[w] = 0;
             }
         }
         indexed_ = !bins_.empty();
@@ -233,6 +275,7 @@ public:
         if (n <= 65536) {
             bins_.resize(n);
             occupied_.resize((n+63)/64);
+            refined_.resize(occupied_.size());
             start_bits_.resize(occupied_.size());
             start_rank_.resize(occupied_.size());
         }
