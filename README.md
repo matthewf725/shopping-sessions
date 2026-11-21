@@ -26,7 +26,7 @@ On Apple silicon, the local Linux simulator executes the AVX-512 build, checks P
 
 ## Measurements
 
-Team Uhhh scored **0.93 s** on the official Xeon practice run for commit `d744498` (receipt `BB-0AFCC483`). The two previous scores were 1.12 s for `1018e64` and 1.52 s for `ef41f89`. [Builders leaderboard](https://www.joinbuilders.org/buildathon/leaderboard)
+Team Uhhh scored **0.87 s** on the official practice scorer for commit `488baf16a48ebc8c708277c6fc898e3ce2286c32`, receipt `BB-38195FEC`. Builders selected it as the team's best entry for the final. Earlier scores were 0.93 s for `d744498`, 1.12 s for `1018e64` and 1.52 s for `ef41f89`. [Builders leaderboard](https://www.joinbuilders.org/buildathon/leaderboard)
 
 The Xeon build that batches shard writes and uses half-hour cells matched both reference tables on two 20M-event, 5M-click inputs. Its three fresh-process runs per seed retired a median of 12.52 billion instructions on seed 719 and 12.41 billion on seed 11971. Median simulated ticks were 1.727 billion and 1.707 billion. Scaling each run against the 1.12 s submission on the same input gives 0.485–0.497 s and 0.469–0.476 s respectively. The official 0.93 s result was about 1.9 times the median estimate. These instruction-based ratios overstated the native speedup.
 
@@ -182,3 +182,18 @@ Each cell is a nine-container median and every output was checked. The four-CPU 
 ### Parser selection on an AVX-512 CPU
 
 The Xeon executable can decode eight records together, decode records individually from a separator-offset table, or select fields from a separator bitmap. Events and clicks choose independently. On representative nontrivial chunks it measures 12 samples per implementation with the worker's thread CPU clock, selects the lowest median time per input byte and uses that reader for later chunks. Every sample contributes to the real output. Small inputs that finish during sampling are processed fully by the same readers. With PROFILE set, the program reports the selected event and click readers as 0 for vector decoding, 1 for scalar decoding with offsets or 2 for scalar decoding with the bitmap. A value of 3 means the sample window did not fill. The Linux Arm table above measures its native scalar reader.
+
+On public seed 719, two x86 Linux simulation runs of the submitted executable chose the eight-row reader for both events and clicks. The output matched all 2,251,704 shopper-day rows and 28,014 campaign-day rows from both the previous submission and the pinned Rust implementation. The two-run medians were 11.75 billion simulated instructions and 1.519 billion simulated ticks for this build, versus 13.33 billion and 1.878 billion for the 0.93 s submission. The official scorer measured a 6.5% improvement. Builders withholds hidden stage timings and hardware counters. [All eight simulated runs](scripts/benchmarks/xeon-seed719-comparison.csv) · [Scoring rules](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions)
+
+### Final-size public input
+
+The native Linux Arm benchmark ran 60M events and 15M clicks from seed 47191 in fresh, CPU-pinned containers with eight workers. All 108 input files matched the SHA-256 manifest from the earlier run. All 24 outputs matched an independently checked reference on every column and key, covering 6,645,833 shopper-day rows and 28,014 campaign-day rows.
+
+| Implementation | Runs | Median start to exit | Range | Median peak RSS |
+| --- | ---: | ---: | ---: | ---: |
+| Submitted C++ source, `488baf1` | 6 | 1.226 s | 0.817–2.217 s | 3.38 GiB |
+| C++ with pooled output, `1159fbe` | 6 | 1.243 s | 0.800–2.628 s | 3.37 GiB |
+| Pinned Rust, `e185a97` | 6 | 0.963 s | 0.850–1.622 s | 2.07 GiB |
+| Earlier official C++ source, `d744498` | 6 | 1.451 s | 0.992–2.321 s | 7.40 GiB |
+
+For the submitted C++ source, the individual stage medians were 475 ms reading and linking, 148 ms selecting duplicates and partitioning, 331 ms grouping shoppers, building sessions and attributing campaigns, and 19 ms writing Parquet. Each median summarizes six runs. The table uses the median of the six whole-container times. [Per-run measurements](scripts/benchmarks/pinned-rust-comparison.csv)
