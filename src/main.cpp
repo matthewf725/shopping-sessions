@@ -1,5 +1,6 @@
 #include "output.hpp"
 #include "blocks.hpp"
+#include "buffered.hpp"
 #include "avx_events.hpp"
 #include <atomic>
 #include <cstdlib>
@@ -192,7 +193,9 @@ struct Pipeline {
 #endif
     }
     void read(const fs::path& data) {
-        CsvFiles ev(data / "events"), ck(data / "clicks"), links(data / "links");
+        CsvPieces ev(data / "events"), ck(data / "clicks");
+        CsvFiles links(data / "links");
+        std::vector<PieceReader> inputs(workers.size());
         // File sizes only estimate capacity. Vectors grow normally for any distribution.
         size_t per_worker = ev.bytes / workers.size();
         auto preallocate = [](auto &rows, size_t estimate) {
@@ -218,8 +221,8 @@ struct Pipeline {
         size_t click_start = 1 + ev.chunks.size();
         parallel(workers.size(), click_start + ck.chunks.size(), [&](size_t wi, size_t job) {
             if (job == 0) people.build(links, users);
-            else if (job < click_start) parse_events(ev.chunks[job - 1], workers[wi]);
-            else parse_clicks(ck.chunks[job - click_start], workers[wi]);
+            else if (job < click_start) parse_events(inputs[wi].read(ev.chunks[job - 1]), workers[wi]);
+            else parse_clicks(inputs[wi].read(ck.chunks[job - click_start]), workers[wi]);
         });
     }
     int64_t ingest_order(PackedEvent e) const {

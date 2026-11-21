@@ -28,7 +28,7 @@ cargo build --release --manifest-path generator/Cargo.toml --locked
 image=shopping-sessions-bench:local
 docker build --platform linux/amd64 -t "$image" "$root"
 run() {
-    local data=$1 out=$2 started finished code
+    local data=$1 out=$2 run_image=${3:-$image} started finished code
     local -a pin=()
     if [[ -n ${CPUSET:-} ]]; then pin=(--cpuset-cpus "$CPUSET"); fi
     mkdir -p "$out/user_daily" "$out/campaign_daily" "$work/scratch"
@@ -38,7 +38,7 @@ run() {
         --user 1000:1000 --pids-limit 4096 --cpus "$cpus" "${pin[@]}" --memory "${memory}g" --memory-swap "${memory}g" \
         -v "$(realpath "$data"):/data:ro" -v "$(realpath "$out"):/output" -v "$work/scratch:/scratch" \
         -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e HOME=/scratch \
-        -e NCPU="$cpus" -e MEM_GB="$memory" "$image")
+        -e NCPU="$cpus" -e MEM_GB="$memory" "$run_image")
     docker start -a "$container"
     read -r started finished code < <(docker inspect -f '{{.State.StartedAt}} {{.State.FinishedAt}} {{.State.ExitCode}}' "$container")
     if [[ $code != 0 ]]; then return 1; fi
@@ -53,8 +53,29 @@ gen=generator/target/release/generate
 "$gen" --seed 1 --events 1000000 --clicks 250000 --threads "$cpus" --output dev
 run dev dev-out
 python3 starter-duckdb/scripts/compare.py dev-out dev-answer
+if [[ -n ${COMPARE_IMAGE:-} ]]; then
+    run dev dev-reference "$COMPARE_IMAGE"
+    python3 starter-duckdb/scripts/compare.py dev-reference dev-answer
+fi
 if [ "$size" = 1000000 ]; then exit 0; fi
 "$gen" --seed "$seed" --events "$size" --clicks "$((size/4))" --threads "$cpus" --output scale
+if [[ -n ${COMPARE_IMAGE:-} ]]; then
+    # Warm the input once outside the timers. The first image alternates across pairs.
+    find scale -type f -exec cat {} + >/dev/null
+    for ((i=1; i<=repeats; ++i)); do
+        methods=(candidate reference)
+        if ((i % 2 == 0)); then methods=(reference candidate); fi
+        for method in "${methods[@]}"; do
+            run_image=$image
+            if [[ $method == reference ]]; then run_image=$COMPARE_IMAGE; fi
+            run scale "out-$method" "$run_image"
+            echo "events=$size seed=$seed vcpus=$cpus repeat=$i method=$method container_ns=$elapsed_ns"
+        done
+        python3 starter-duckdb/scripts/compare.py out-candidate out-reference
+        rm -r out-candidate out-reference
+    done
+    exit 0
+fi
 for ((i=1; i<=repeats; ++i)); do
     run scale "out-$i"
     echo "events=$size seed=$seed vcpus=$cpus repeat=$i container_ms=$((elapsed_ns/1000000))"

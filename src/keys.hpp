@@ -121,36 +121,110 @@ public:
 };
 
 class People {
-    FlatMap<uint64_t> entries_;  // During union-find: node index. Afterwards: canonical key.
+    struct Tree {
+        int32_t parent_or_size;
+        uint32_t smallest;
+    };
+    struct Slot {
+        Key key{};
+        union { Tree tree; Key canonical; };
+        Slot() : tree{-1, 0} {}
+    };
+    static_assert(sizeof(Slot) == 16);
+    std::vector<Slot> slots_;
+    size_t used_ = 0;
+
+    static uint32_t position(const std::vector<Slot>& table, Key key, uint64_t hash) {
+        size_t mask = table.size() - 1;
+        uint32_t i = uint32_t(hash & mask);
+        while (table[i].key && table[i].key != key)
+            i = uint32_t((i + 1) & mask);
+        return i;
+    }
+    uint32_t root(uint32_t i) {
+        while (slots_[i].tree.parent_or_size >= 0) {
+            auto parent = uint32_t(slots_[i].tree.parent_or_size);
+            auto grandparent = slots_[parent].tree.parent_or_size;
+            if (grandparent < 0) return parent;
+            slots_[i].tree.parent_or_size = grandparent;
+            i = uint32_t(grandparent);
+        }
+        return i;
+    }
+    void grow(size_t count) {
+        size_t capacity = std::bit_ceil(std::max<size_t>(16, count + count / 2 + 2));
+        if (capacity <= slots_.size()) return;
+        if (capacity > size_t{1} << 31) throw std::bad_alloc();
+        std::vector<Slot> larger(capacity);
+        std::vector<uint32_t> moved(slots_.size());
+        for (size_t i = 0; i < slots_.size(); ++i) {
+            if (!slots_[i].key) continue;
+            auto j = position(larger, slots_[i].key, table_hash(slots_[i].key));
+            larger[j].key = slots_[i].key;
+            moved[i] = j;
+        }
+        for (size_t i = 0; i < slots_.size(); ++i) {
+            if (!slots_[i].key) continue;
+            auto state = slots_[i].tree;
+            if (state.parent_or_size >= 0)
+                state.parent_or_size = int32_t(moved[uint32_t(state.parent_or_size)]);
+            state.smallest = moved[state.smallest];
+            larger[moved[i]].tree = state;
+        }
+        slots_.swap(larger);
+    }
+    uint32_t node(Key key, uint64_t hash) {
+        uint32_t i = position(slots_, key, hash);
+        if (slots_[i].key) return i;
+        slots_[i].key = key;
+        slots_[i].tree = {-1, i};
+        ++used_;
+        return i;
+    }
 public:
     void build(const CsvFiles& links, Keys& keys) {
-        entries_.reserve(links.bytes / 17);
-        struct Node { uint32_t parent, size; Key name; };
-        std::vector<Node> nodes;
-        nodes.reserve(links.bytes / 17);
-        auto root = [&](uint32_t i) {
-            while (nodes[i].parent != i) { i = nodes[i].parent = nodes[nodes[i].parent].parent; }
-            return i;
-        };
-        auto node = [&](Key key) {
-            auto [i, fresh] = entries_.add(key, nodes.size());
-            if (fresh) nodes.push_back({uint32_t(i), 1, key});
-            return root(uint32_t(i));
+        grow(links.bytes / 17);
+        struct Edge { Key left, right; uint64_t left_hash, right_hash; };
+        std::array<Edge, 32> batch;
+        size_t count = 0;
+        auto flush = [&] {
+            // All inserted nodes in this batch keep their slot until both endpoints are joined.
+            if ((used_ + 2 * count) * 3 > slots_.size() * 2) grow(used_ + 2 * count);
+            for (size_t i = 0; i < count; ++i) {
+                const auto& edge = batch[i];
+                uint32_t a = root(node(edge.left, edge.left_hash));
+                uint32_t b = root(node(edge.right, edge.right_hash));
+                if (a == b) continue;
+                if (slots_[a].tree.parent_or_size > slots_[b].tree.parent_or_size) std::swap(a, b);
+                auto& winner = slots_[a].tree;
+                auto& child = slots_[b].tree;
+                winner.parent_or_size += child.parent_or_size;
+                child.parent_or_size = int32_t(a);
+                if (keys.less(slots_[child.smallest].key, slots_[winner.smallest].key))
+                    winner.smallest = child.smallest;
+            }
+            count = 0;
         };
         for (auto chunk : links.chunks) read_rows<2>(chunk, [&](const auto& f) {
             if (f[0].empty() || f[1].empty()) return;
-            uint32_t a = node(keys.encode(f[0])), b = node(keys.encode(f[1]));
-            if (a == b) return;
-            if (nodes[a].size < nodes[b].size) std::swap(a, b);
-            nodes[b].parent = a;
-            nodes[a].size += nodes[b].size;
-            if (keys.less(nodes[b].name, nodes[a].name)) nodes[a].name = nodes[b].name;
+            Key a = keys.encode(f[0]), b = keys.encode(f[1]);
+            uint64_t ah = table_hash(a), bh = table_hash(b);
+            __builtin_prefetch(&slots_[ah & (slots_.size() - 1)], 1, 1);
+            __builtin_prefetch(&slots_[bh & (slots_.size() - 1)], 1, 1);
+            batch[count++] = {a, b, ah, bh};
+            if (count == batch.size()) flush();
         });
-        for (auto& slot : entries_.slots()) if (slot.key) slot.value = nodes[root(uint32_t(slot.value))].name;
+        flush();
+        for (uint32_t i = 0; i < slots_.size(); ++i)
+            if (slots_[i].key)
+                slots_[i].tree.smallest = slots_[root(i)].tree.smallest;
+        for (auto& s : slots_)
+            if (s.key)
+                s.canonical = slots_[s.tree.smallest].key;
     }
     Key linked_name(Key key) const {
-        const auto* name = entries_.get(key);
-        return name ? *name : 0;
+        const auto& slot = slots_[position(slots_, key, table_hash(key))];
+        return slot.key ? slot.canonical : 0;
     }
 };
 

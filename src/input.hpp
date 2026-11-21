@@ -64,22 +64,27 @@ public:
     }
 };
 
+template<class F> void for_csv_file(const fs::path& path, F visit) {
+    if (fs::is_directory(path)) {
+        for (const auto& file : fs::directory_iterator(path))
+            if (file.is_regular_file() && file.path().extension() == ".csv") visit(file.path());
+    } else {
+        visit(path);
+    }
+}
+
 class CsvFiles {
     std::vector<std::unique_ptr<MappedCsv>> mappings_;
 public:
     std::vector<Chunk> chunks;
     size_t bytes = 0;
     explicit CsvFiles(const fs::path& path) {
-        auto add = [&](const fs::path& p) {
+        for_csv_file(path, [&](const fs::path& p) {
             auto file = std::make_unique<MappedCsv>(p);
             bytes += file->size();
             file->chunks(chunks);
             mappings_.push_back(std::move(file));
-        };
-        if (fs::is_directory(path)) {
-            for (const auto& f : fs::directory_iterator(path))
-                if (f.is_regular_file() && f.path().extension() == ".csv") add(f.path());
-        } else add(path);
+        });
     }
 };
 
