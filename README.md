@@ -18,7 +18,7 @@ This branch freezes linked aliases with at least 32 events into immutable search
 
 In a constructed case a single bridging history joined 1,024 separated intervals with one new interval node. Both input versions were still queryable. A further 3,072 randomized merges agreed with a chronological reference on endpoints, event counts and revenue per category. Run the version-preservation test with `c++ -O2 -std=c++20 -Isrc tests/persistent_sessions.cpp -o /tmp/check-persistent && /tmp/check-persistent /path/to/input/manifest.json`.
 
-On an independent 2M-event, 500k-click input, the tree and the ordinary session builder produced identical user and campaign tables. Across two alternating local Linux AVX-512 simulator runs, the session and attribution stage took 31.62 ms of guest time with the tree and 17.27 ms with the ordinary builder. Whole-process simulated ticks increased 18.6%. The tree also passed all 36 organizer fixtures. The scoring branch retains the faster session builder.
+On an independent 2M-event, 500k-click input, the tree and the ordinary session builder produced identical user and campaign tables. Across two alternating local Linux AVX-512 simulator runs, the session and attribution stage took 31.62 ms of guest time with the tree and 17.27 ms with the ordinary builder. Whole-process simulated ticks increased 18.6%. On a fresh 20M-event, 5M-click input (seed 11971), its two session and attribution times were 289.21 and 282.64 ms in the simulator. All 2,237,708 user-day rows and 28,014 campaign-day rows matched the reference. The tree also passed all 36 organizer fixtures. The scoring branch retains the faster session builder.
 
 ## Verification
 
