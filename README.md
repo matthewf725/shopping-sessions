@@ -7,10 +7,10 @@ A C++20 pipeline for the [Builders Shopping Sessions track](https://www.joinbuil
 1. One worker builds the identity graph from the links while the other workers parse CSV chunks. The AVX-512BW build for Cascade Lake scans 64 bytes at a time, checks quote parity at separators and decodes the four date and time pairs in parallel. Event records usually take 24 bytes. Purchases and timestamps outside the compact range have an exact side record.
 2. Partition events by exact event ID and retain the earliest ingestion time, including invalid copies. A bitmap sends potential duplicates to an exact hash table. Group the winners and the valid clicks by raw user ID. Each distinct raw ID then needs one identity lookup. A linked shopper's event and click ranges stay in place. The session builder reads them through a list of ranges.
 3. After deduplication and identity linking, each two-hour slot for a shopper starts with one connected interval. An event inside it or within 30 minutes of either endpoint extends that interval. A farther event triggers refinement of just that slot into at most four half-hour cells. The previous interval retains its counts and purchases, and later events can bridge a gap. A bitmap visits the resulting intervals in time order and compares their endpoints across slot boundaries. Very wide windows use four radix passes over occupied half-hour cell numbers.
-4. Session starts are more than 30 minutes apart. A bitmap and prefix counts map a click's seven-day interval to a range of sessions. Keep the most recent click first eligible at each session, breaking ties by ID, then carry the winner forward until expiration. OR the eligible range into a campaign bitset to count each assist once. Identical click copies give identical winners and set the same bits.
+4. Session starts are more than 30 minutes apart. A bitmap and prefix counts find the first start eligible for each click. Keep the most recent click at that start, breaking ties by ID, then carry the winner forward until expiration. For assists, group a shopper's clicks by campaign and seven-day bucket. All windows in a bucket overlap, so the earliest eligible session and the latest click determine their exact union. Only adjacent buckets can overlap. Clip each range at the following bucket's first eligible session and count each UTC day's share by subtracting session positions. Identical clicks preserve both endpoints.
 5. Workers write independent user Parquet files and reduce campaign totals. Apache Arrow's C++ Parquet writer (21.0.0) is the output library. The CSV scanner, deduplication, session construction and attribution code were written for this track.
 
-For the 14-day input window, each event takes expected constant work. A seven-day click range spans at most 337 session starts and seven 64-bit words. Input row order has no effect on the result. No event or click comparison sort is used.
+For the 14-day input window, each event takes expected constant work. The allowed click dates occupy three seven-day buckets including the pre-window lookback. Given `c` clicks, `b` occupied shopper/campaign/week groups and `d` covered group/day intersections after clipping, assist aggregation takes `O(c + b + d)` work. Shuffling the rows preserves the result.
 
 ## Verification
 
@@ -18,7 +18,7 @@ For the 14-day input window, each event takes expected constant work. A seven-da
 
 For a native build, run `make ARROW_PREFIX=/path/to/arrow`. Run `./pipeline INPUT EMPTY_OUTPUT` with `NCPU` set to the desired thread count. Set `PROFILE=1` for stage timings on stderr.
 
-`python tests/differential.py ./pipeline --generator /path/to/generate` compares the pipeline with an independent chronological reference on six generated seeds and three crafted cases covering multiword click ranges, unusual IDs, a wide calendar window and records spanning multiple file chunks.
+`python tests/differential.py ./pipeline --generator /path/to/generate` compares the pipeline with an independent chronological reference on six generated seeds and four crafted cases. They cover overlapping, touching and disjoint click windows, unusual IDs, both dense and sparse week storage, and records spanning multiple file chunks.
 
 ## Measurements
 
@@ -54,6 +54,21 @@ Twelve interleaved warm runs per build on the eight-worker M4 Max gave median pr
 
 The CSV reader also retains the complete lines preceding a quote error. On seed 211 the previous tile fallback sent 383,568 event rows to the strict reader after a vector quote check failed. The new check isolated 3,623 malformed physical lines and resumed at the next newline. Both readers accepted the same 21,425,622 syntactically valid event rows.
 
-The standalone `scripts/shape_index.cpp` indexes the two predicted row properties described above. It scans the event files once in filename order, counting physical data rows from zero and recording a file and byte offset for each exception. A query binary-searches the sorted list of exceptions and visits only the entries in the requested half-open range. With `H` exceptions in the index and `h` in the range, the query takes `O(log(1 + H) + h)` work. Building the index reads all the event bytes. On seed 211, 20,000 range queries checked against a row-by-row oracle needed at most 22 comparisons to locate their first candidate among 3,244,877 exceptions.
+### Campaign assists
 
-Build the diagnostic with `c++ -O3 -std=c++20 -Isrc scripts/shape_index.cpp -o /tmp/shape-index`. Run `/tmp/shape-index /path/to/data` and enter pairs such as `1000 1250` on standard input. Each result gives the physical row number, part filename and byte offset. The timed pipeline processes all events directly.
+These are pooled medians from two interleaved batches, 24 warm fresh processes per build per seed, on the M4 Max with eight workers and RAM-backed input and output. Both tables matched the baseline `131243f` row for row on both seeds. The session and attribution stage improved on each seed. Whole-process medians moved in opposite directions.
+
+| 20M-event seed | Individual assists | Day-total updates | Baseline sessions and attribution | Grouped sessions and attribution | Baseline start to exit | Grouped start to exit |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 211 | 36,122,537 | 11,312,487 | 92.82 ms | 89.45 ms | 391.64 ms | 394.11 ms |
+| 307 | 37,093,335 | 11,667,852 | 94.44 ms | 91.11 ms | 389.51 ms | 387.49 ms |
+
+### Queries on CSV row patterns
+
+The standalone `scripts/shape_index.cpp` indexes the ID-width and UTC-date conditions above. One pass in filename order numbers the physical data rows from zero. For each 64 rows it stores a 64-bit exception mask and the number of exceptions before that word. Two prefix counts give the exact number of exceptions in any half-open range in `O(1)`. Count and selection queries store 16 bytes of directory entries per 64 rows plus one sentinel.
+
+To select the zero-based `k`th exception, the range's exact density predicts a row. The word's prefix counts tell the search which way to move. It doubles the jump distance until the counts bracket the target, binary-searches those words and selects the bit in the final word. For a prediction off by `d` words, the query takes `O(log(2 + d))` work under any arrangement of the input. A poor prediction changes the number of probes while preserving the answer.
+
+Seed 211 had 21,434,677 physical rows and 3,244,877 exceptions. The index returned identical answers to the explicitly stored exception list for 20,006 counts and 20,010 selections. The millionth exception was at row 6,604,305, 21 words from its predicted location. Across the sampled nonempty ranges the median error was 21 words and the 99th percentile was 100 words.
+
+Build with `c++ -O3 -march=native -std=c++20 -Isrc scripts/shape_index.cpp -o /tmp/shape-index`. Run `/tmp/shape-index DATA` and enter `first stop` to count exceptions. With `--select`, enter `first stop k` to get the physical row number or `none`. With `--list`, enter `first stop` to print the original row, filename and byte-offset listing. Run `python3 tests/shape_index.py /tmp/shape-index` to check shuffled and clustered layouts. The timed pipeline reads its own fresh CSV input directly.

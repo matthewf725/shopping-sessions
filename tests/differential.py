@@ -181,6 +181,17 @@ def adversarial(data, years):
         for i, minute in enumerate(minutes):
             ts = base + 2*DAY + minute*60_000
             events.append((f'{who}-{i}', who, str(ts), iso(ts), 'purchase', 'p1', '101'))
+    # Seven-day assist windows can meet at one start, overlap, or leave a genuine hole.
+    # Include the first and last millisecond of adjacent buckets, and skip an entire bucket.
+    hour = 3_600_000
+    for h in range(14 * 24):
+        ts = base + h * hour
+        events.append((f'seam-e{h}', 'seams', str(ts), iso(ts), 'view', 'p1', ''))
+    for campaign, offsets in [('c_1', [-WEEK, -1, 0, WEEK-1, WEEK, WEEK+1]),
+                              ('c_2', [-3*DAY, 4*DAY+2*hour]),
+                              ('c_01', [-WEEK+hour, WEEK, WEEK+hour])]:
+        for i, offset in enumerate(offsets):
+            clicks.append((f'seam-{campaign}-{i}', 'seams', campaign, str(base + offset)))
     data_sets = {'events': ('event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents', events),
                  'clicks': ('click_id,user_id,campaign_id,ts', clicks), 'links': ('user_id_a,user_id_b', links)}
     for name, (header, rows) in data_sets.items():
@@ -232,8 +243,8 @@ if __name__ == '__main__':
     args = parser.parse_args()
     with tempfile.TemporaryDirectory() as path:
         root = Path(path)
-        for years in (0, 12):
-            data = root / ('wide' if years else 'dense')
+        for name, years in [('dense', 0), ('wide', 12), ('sparse-weeks', 5200)]:
+            data = root / name
             adversarial(data, years)
             check(args.pipeline.resolve(), data, root / (data.name+'-out'))
         data = root / 'chunk-boundaries'

@@ -39,9 +39,6 @@ public:
     }
 };
 
-inline uint64_t below_bit(unsigned bit) { return (uint64_t(1) << bit) - 1; }
-inline uint64_t through_bit(unsigned bit) { return ~uint64_t(0) >> (63 - bit); }
-
 // For very wide manifests, order only occupied cell numbers with four byte passes.
 inline void radix_cells(std::vector<uint32_t>& cells, std::vector<uint32_t>& scratch) {
     if (cells.size() < 2) return;
@@ -59,7 +56,8 @@ inline void radix_cells(std::vector<uint32_t>& cells, std::vector<uint32_t>& scr
 class Shopper {
     struct Bucket { Time first, last; uint32_t events, purchases; };
     struct Purchase { uint32_t price, category, next; };
-    struct Session { Time start; int64_t revenue; Click credit; int32_t day; };
+    struct Session { Time start; int64_t revenue; Click credit; int32_t day; uint32_t day_index; };
+    struct AssistRange { size_t first_session = SIZE_MAX; Time latest_click = invalid_time; };
     static constexpr uint32_t none = UINT32_MAX;
     Time origin_;
     const Keys& click_keys_;
@@ -71,14 +69,15 @@ class Shopper {
     std::vector<uint32_t> order_, radix_scratch_;
     std::vector<Purchase> purchases_;
     std::vector<Session> sessions_;
+    std::vector<size_t> day_ends_; // Exclusive session rank for each occupied UTC day.
     std::vector<int64_t> category_sums_;
     std::vector<uint32_t> categories_used_;
-    std::vector<uint64_t> coverage_;
+    std::vector<AssistRange> coverage_;
     std::vector<size_t> touched_;
-    std::unordered_map<uint64_t, uint64_t> sparse_coverage_;
+    std::unordered_map<size_t, AssistRange> sparse_coverage_;
     size_t campaign_count_;
     size_t first_word_ = 0, last_word_ = 0;
-    bool indexed_ = false, dense_coverage_ = true;
+    bool indexed_ = false;
 
     uint32_t cell(Time t) const { return uint32_t((t - origin_) / gap); }
     void clear_categories() {
@@ -153,16 +152,18 @@ class Shopper {
         }
     }
     void form_sessions(Key person, std::vector<UserDay>& users) {
+        day_ends_.clear();
         Time last = invalid_time;
         auto take = [&](const Bucket& b) {
             if (last == invalid_time || b.first - last > gap) {
                 int32_t day = utc_day(b.first);
                 if (sessions_.empty() || sessions_.back().day != day) {
+                    if (!sessions_.empty()) day_ends_.push_back(sessions_.size());
                     clear_categories();
                     users.push_back({person, day, 0, 0, 0, 0});
                 }
                 ++users.back().sessions;
-                sessions_.push_back({b.first, 0, {invalid_time, 0, 0}, day});
+                sessions_.push_back({b.first, 0, {invalid_time, 0, 0}, day, uint32_t(day_ends_.size())});
                 if (!bins_.empty()) {
                     uint32_t start = cell(b.first);
                     start_bits_[start >> 6] |= uint64_t(1) << (start & 63);
@@ -202,6 +203,7 @@ class Shopper {
             }
         }
         indexed_ = !bins_.empty();
+        day_ends_.push_back(sessions_.size());
         purchases_.clear();
     }
     // Number of session starts < t (or <= t). At most one start can occupy any gap-width cell.
@@ -221,42 +223,44 @@ class Shopper {
         if ((word & bit) && (inclusive ? sessions_[n].start <= t : sessions_[n].start < t)) ++n;
         return n;
     }
-    void cover(uint32_t campaign, size_t first, size_t stop) {
-        size_t a = first >> 6, b = (stop - 1) >> 6;
-        for (size_t w = a; w <= b; ++w) {
-            uint64_t bits = ~uint64_t(0);
-            if (w == a) bits &= ~below_bit(first & 63);
-            if (w == b) bits &= through_bit((stop - 1) & 63);
-            size_t at = w * campaign_count_ + campaign;
-            if (dense_coverage_) {
-                if (!coverage_[at]) touched_.push_back(at);
-                coverage_[at] |= bits;
-            } else sparse_coverage_[at] |= bits;
-        }
-    }
     void attribute(const Segment* chain, CampaignDays& campaigns) {
-        size_t words = (sessions_.size() + 63) / 64;
-        dense_coverage_ = words <= 1'000'000 / campaign_count_;
-        if (dense_coverage_ && coverage_.size() < words * campaign_count_) coverage_.resize(words * campaign_count_);
         for (auto seg = chain; seg; seg = seg->next) for (uint32_t i = 0; i < seg->m; ++i) {
             const Click& c = seg->clicks[i];
             size_t first = rank(c.ts, false);
             if (first == sessions_.size() || sessions_[first].start - c.ts > week_ms) continue;
             auto& best = sessions_[first].credit;
             if (c.ts > best.ts || (c.ts == best.ts && click_keys_.less(c.id, best.id))) best = c;
-            cover(c.campaign, first, rank(c.ts + week_ms, true));
+            // Every pair of clicks in a week has overlapping seven-day windows.
+            size_t week = size_t((c.ts - origin_ + week_ms) / week_ms);
+            size_t at = week * campaign_count_ + c.campaign;
+            auto& range = coverage_.empty() ? sparse_coverage_[at] : coverage_[at];
+            if (range.first_session == SIZE_MAX && !coverage_.empty()) touched_.push_back(at);
+            range.first_session = std::min(range.first_session, first);
+            range.latest_click = std::max(range.latest_click, c.ts);
         }
-        auto assists = [&](size_t at, uint64_t mask) {
-            size_t base = at / campaign_count_ * 64;
-            uint32_t campaign = at % campaign_count_;
-            while (mask) {
-                ++campaigns.at(campaign, sessions_[base + std::countr_zero(mask)].day).assists;
-                mask &= mask - 1;
+        auto assists = [&](size_t at, const AssistRange& range, size_t next_first) {
+            // The only later bucket that can overlap is the next week. It owns the overlap.
+            size_t first = range.first_session;
+            if (first >= next_first) return;
+            size_t stop = std::min(next_first, rank(range.latest_click + week_ms, true));
+            uint32_t campaign = uint32_t(at % campaign_count_);
+            while (first < stop) {
+                const auto& s = sessions_[first];
+                size_t end = std::min(stop, day_ends_[s.day_index]);
+                campaigns.at(campaign, s.day).assists += end - first;
+                first = end;
             }
         };
-        for (size_t at : touched_) { assists(at, coverage_[at]); coverage_[at] = 0; }
+        for (size_t at : touched_) {
+            size_t next = at + campaign_count_;
+            assists(at, coverage_[at], next < coverage_.size() ? coverage_[next].first_session : SIZE_MAX);
+        }
+        for (size_t at : touched_) coverage_[at] = {};
         touched_.clear();
-        for (auto [at, bits] : sparse_coverage_) assists(at, bits);
+        for (const auto& [at, range] : sparse_coverage_) {
+            auto next = sparse_coverage_.find(at + campaign_count_);
+            assists(at, range, next == sparse_coverage_.end() ? SIZE_MAX : next->second.first_session);
+        }
         sparse_coverage_.clear();
         Click latest{invalid_time, 0, 0};
         for (const auto& s : sessions_) {
@@ -271,6 +275,8 @@ class Shopper {
 public:
     Shopper(const Window& w, const Dimensions& d, const Keys& click_keys)
         : origin_(w.start), click_keys_(click_keys), category_sums_(d.categories.size()+1), campaign_count_(d.names.size()) {
+        size_t weeks = size_t((w.end - w.start - 1) / week_ms) + 2;
+        if (weeks <= 1'000'000 / campaign_count_) coverage_.resize(weeks * campaign_count_);
         size_t n = size_t((w.end - w.start - 1) / gap + 1);
         if (n <= 65536) {
             bins_.resize(n);
