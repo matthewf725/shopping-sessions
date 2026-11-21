@@ -5,6 +5,14 @@ namespace shop {
 constexpr Time gap = 30 * 60 * 1000;
 struct Event { Time ts; uint32_t price, category; };
 struct Click { Time ts; Key id; uint32_t campaign; };
+// A range of observations for one raw user. Linked aliases share a chain.
+struct Segment {
+    const Event* events;
+    const Click* clicks;
+    uint32_t n, m;
+    Key name;
+    Segment* next = nullptr;
+};
 struct UserDay { Key person; int32_t day, sessions, events; uint32_t top; int64_t revenue; };
 struct Totals { int64_t sessions{}, purchasing{}, revenue{}, assists{}; };
 
@@ -78,8 +86,6 @@ class Shopper {
         categories_used_.clear();
     }
     void collect(const Event* events, size_t count) {
-        first_word_ = occupied_.size();
-        last_word_ = 0;
         for (size_t i = 0; i < count; ++i) {
             const Event& e = events[i];
             uint32_t pos = cell(e.ts);
@@ -186,12 +192,12 @@ class Shopper {
             } else sparse_coverage_[at] |= bits;
         }
     }
-    void attribute(const Click* clicks, size_t count, CampaignDays& campaigns) {
+    void attribute(const Segment* chain, CampaignDays& campaigns) {
         size_t words = (sessions_.size() + 63) / 64;
         dense_coverage_ = words <= 1'000'000 / campaign_count_;
         if (dense_coverage_ && coverage_.size() < words * campaign_count_) coverage_.resize(words * campaign_count_);
-        for (size_t i = 0; i < count; ++i) {
-            const Click& c = clicks[i];
+        for (auto seg = chain; seg; seg = seg->next) for (uint32_t i = 0; i < seg->m; ++i) {
+            const Click& c = seg->clicks[i];
             size_t first = rank(c.ts, false);
             if (first == sessions_.size() || sessions_[first].start - c.ts > week_ms) continue;
             auto& best = sessions_[first].credit;
@@ -231,13 +237,18 @@ public:
             start_rank_.resize(occupied_.size());
         }
     }
-    void run(Key person, const Event* events, size_t n, const Click* clicks, size_t m,
-             std::vector<UserDay>& users, CampaignDays& campaigns) {
-        if (!n) return;
+    void run(Key person, const Segment* chain, std::vector<UserDay>& users, CampaignDays& campaigns) {
         sessions_.clear();
-        collect(events, n);
+        first_word_ = occupied_.size();
+        last_word_ = 0;
+        bool has_events = false;
+        for (auto seg = chain; seg; seg = seg->next) if (seg->n) {
+            collect(seg->events, seg->n);
+            has_events = true;
+        }
+        if (!has_events) return;
         form_sessions(person, users);
-        attribute(clicks, m, campaigns);
+        attribute(chain, campaigns);
     }
 };
 } // namespace shop

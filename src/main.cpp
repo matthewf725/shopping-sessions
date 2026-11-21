@@ -7,20 +7,29 @@
 namespace shop {
 constexpr size_t partitions = 256;
 inline size_t partition(Key key) { return hash_key(key) >> 56; }
-struct RawEvent { Key id, person; Time ingest; Event event; };
+// Views and carts need only two words beyond their IDs. Purchases and unusual
+// date ranges point into their parser worker's exact, immutable detail array.
+constexpr uint32_t detailed = 0x80000000u;
+constexpr int64_t seconds_bias = int64_t(1) << 30;
+struct PackedEvent { uint32_t when, tag; };
+struct Detail { Time ingest; Event event; };
+struct RawEvent { Key id, person; PackedEvent event; };
+static_assert(sizeof(RawEvent) == 24);
 template<class T> struct Owned { Key person; T value; };
-using OwnedEvent = Owned<Event>;
+using OwnedEvent = Owned<PackedEvent>;
 using OwnedClick = Owned<Click>;
 struct Worker {
+    uint32_t number;
+    std::vector<Detail> details;
     std::array<std::vector<RawEvent>, partitions> parsed;
-    std::vector<OwnedClick> raw_clicks;
+    std::array<std::vector<Segment>, partitions> segments;
     std::array<std::vector<OwnedEvent>, partitions> events;
     std::array<std::vector<OwnedClick>, partitions> clicks;
     std::vector<UserDay> days;
     CampaignDays campaigns;
     Shopper shopper;
-    Worker(const Window& w, const Dimensions& d, const Keys& click_keys)
-        : campaigns(w, d.names.size()), shopper(w, d, click_keys) {}
+    Worker(uint32_t index, const Window& w, const Dimensions& d, const Keys& click_keys)
+        : number(index), campaigns(w, d.names.size()), shopper(w, d, click_keys) {}
 };
 
 template<class F> void parallel(size_t n, size_t jobs, F fn) {
@@ -52,6 +61,8 @@ struct Pipeline {
     Dimensions dim;
     Keys events{'e'}, users{'u'}, click_keys{'k'};
     People people;
+    struct RawStore { std::vector<Event> events; std::vector<Click> clicks; };
+    std::array<RawStore, partitions> stores;
     std::vector<Worker> workers;
     using Timer = std::chrono::steady_clock;
     Timer::time_point last = Timer::now();
@@ -62,7 +73,7 @@ struct Pipeline {
     }
     Pipeline(const fs::path& data, size_t n) : window(data / "manifest.json"), dim(data) {
         workers.reserve(n);
-        for (size_t i = 0; i < n; ++i) workers.emplace_back(window, dim, click_keys);
+        for (size_t i = 0; i < n; ++i) workers.emplace_back(uint32_t(i), window, dim, click_keys);
     }
     void parse_events(Chunk chunk, Worker& w) {
         read_rows<7>(chunk, [&](const auto& f) {
@@ -83,7 +94,16 @@ struct Pipeline {
                     if (!category) category = dim.unknown;
                 }
             } else if (valid) valid = f[4] == "view" || f[4] == "cart";
-            w.parsed[partition(id)].push_back({id, valid ? users.encode(f[1]) : 0, ingest, {ts, price, category}});
+            uint64_t when = valid ? uint64_t(ts - window.start) : 0;
+            int64_t seconds = (ingest - window.start) / 1000 + seconds_bias;
+            PackedEvent event;
+            if (!price && when <= UINT32_MAX && uint64_t(seconds) < detailed) {
+                event = {uint32_t(when), uint32_t(seconds)};
+            } else {
+                event = {uint32_t(w.details.size()), detailed | w.number};
+                w.details.push_back({ingest, {ts, price, category}});
+            }
+            w.parsed[partition(id)].push_back({id, valid ? users.encode(f[1]) : 0, event});
         });
     }
     void parse_clicks(Chunk chunk, Worker& w) {
@@ -93,7 +113,8 @@ struct Pipeline {
             if (!campaign) return;
             Time ts = window.clock.parse(f[3]);
             if (ts < window.start - week_ms || ts >= window.end) return;
-            w.raw_clicks.push_back({users.encode(f[1]), {ts, click_keys.encode(f[0]), campaign}});
+            Key raw_user = users.encode(f[1]);
+            w.clicks[partition(raw_user)].push_back({raw_user, {ts, click_keys.encode(f[0]), campaign}});
         });
     }
     void read(const fs::path& data) {
@@ -101,7 +122,7 @@ struct Pipeline {
         for (auto& w : workers) {
             size_t hint = ev.bytes / (74 * workers.size() * partitions);
             for (auto& v : w.parsed) v.reserve(hint);
-            w.raw_clicks.reserve(ck.bytes / (48 * workers.size()));
+            for (auto& v : w.clicks) v.reserve(ck.bytes / (48 * workers.size() * partitions));
         }
         size_t click_start = 1 + ev.chunks.size();
         parallel(workers.size(), click_start + ck.chunks.size(), [&](size_t wi, size_t job) {
@@ -109,6 +130,14 @@ struct Pipeline {
             else if (job < click_start) parse_events(ev.chunks[job - 1], workers[wi]);
             else parse_clicks(ck.chunks[job - click_start], workers[wi]);
         });
+    }
+    Time ingestion(PackedEvent e) const {
+        if (e.tag & detailed) return workers[e.tag ^ detailed].details[e.when].ingest;
+        return window.start + (int64_t(e.tag) - seconds_bias) * 1000;
+    }
+    Event unpack(PackedEvent e) const {
+        if (e.tag & detailed) return workers[e.tag ^ detailed].details[e.when].event;
+        return {window.start + e.when, 0, 0};
     }
     void dedup(size_t p, Worker& dst) {
         size_t size = 0;
@@ -130,8 +159,7 @@ struct Pipeline {
         FlatMap<RawEvent*> best(size / 10);
         auto emit = [&](const RawEvent& row) {
             if (row.person) {
-                Key person = people.resolve(row.person);
-                dst.events[partition(person)].push_back({person, row.event});
+                dst.events[partition(row.person)].push_back({row.person, row.event});
             }
         };
         for (auto& w : workers) for (auto& row : w.parsed[p]) {
@@ -141,24 +169,12 @@ struct Pipeline {
                 continue;
             }
             auto [prev, fresh] = best.add(row.id, &row);
-            if (!fresh && row.ingest < prev->ingest) prev = &row;
+            if (!fresh && ingestion(row.event) < ingestion(prev->event)) prev = &row;
         }
         for (const auto& slot : best.slots()) if (slot.key) emit(*slot.value);
         for (auto& w : workers) std::vector<RawEvent>().swap(w.parsed[p]);
     }
-    void distribute() {
-        size_t n = workers.size();
-        parallel(n, partitions + n, [&](size_t wi, size_t job) {
-            auto& dst = workers[wi];
-            if (job >= n) return dedup(job - n, dst);
-            for (const auto& c : workers[job].raw_clicks) {
-                Key person = people.resolve(c.person);
-                dst.clicks[partition(person)].push_back({person, c.value});
-            }
-            std::vector<OwnedClick>().swap(workers[job].raw_clicks);
-        });
-    }
-    void aggregate(size_t p, Worker& dst) {
+    void group_aliases(size_t p, Worker& dst) {
         struct Group { Key key; size_t events = 0, clicks = 0; };
         size_t ne = 0;
         for (auto& w : workers) ne += w.events[p].size();
@@ -171,8 +187,10 @@ struct Pipeline {
             e.person = i;
         }
         for (auto& w : workers) for (auto& c : w.clicks[p]) {
-            if (auto* i = index.get(c.person)) { c.person = *i; ++groups[*i].clicks; }
-            else c.person = UINT64_MAX;
+            auto [i, fresh] = index.add(c.person, uint32_t(groups.size()));
+            if (fresh) groups.push_back({c.person});
+            ++groups[i].clicks;
+            c.person = i;
         }
         size_t en = 0, cn = 0;
         for (auto& g : groups) {
@@ -180,25 +198,46 @@ struct Pipeline {
             g.events = en; g.clicks = cn;
             en = next_e; cn = next_c;
         }
-        // Counting scatter groups unsorted observations by person in two linear passes.
-        std::vector<Event> ev(en);
-        std::vector<Click> ck(cn);
+        // Scatter once by raw ID. These arrays stay in place through the canonical
+        // shopper pass, so joining aliases moves only range descriptors.
+        auto& ev = stores[p].events;
+        auto& ck = stores[p].clicks;
+        ev.resize(en);
+        ck.resize(cn);
         for (auto& w : workers) {
-            for (auto& e : w.events[p]) ev[groups[e.person].events++] = e.value;
-            for (auto& c : w.clicks[p]) if (c.person != UINT64_MAX) ck[groups[c.person].clicks++] = c.value;
+            for (auto& e : w.events[p]) ev[groups[e.person].events++] = unpack(e.value);
+            for (auto& c : w.clicks[p]) ck[groups[c.person].clicks++] = c.value;
             std::vector<OwnedEvent>().swap(w.events[p]);
             std::vector<OwnedClick>().swap(w.clicks[p]);
         }
         size_t e0 = 0, c0 = 0;
         for (auto& g : groups) {
-            dst.shopper.run(g.key, ev.data() + e0, g.events - e0, ck.empty() ? nullptr : ck.data() + c0, g.clicks - c0, dst.days, dst.campaigns);
+            // A click-only alias may share a person with an event in another shard.
+            Key canonical = people.linked_name(g.key);
+            Segment seg{g.events != e0 ? ev.data() + e0 : nullptr, g.clicks != c0 ? ck.data() + c0 : nullptr,
+                        uint32_t(g.events-e0), uint32_t(g.clicks-c0), canonical};
+            if (canonical) dst.segments[partition(canonical)].push_back(seg);
+            else dst.shopper.run(g.key, &seg, dst.days, dst.campaigns);
             e0 = g.events; c0 = g.clicks;
         }
     }
+    void join_aliases(size_t p, Worker& dst) {
+        size_t count = 0;
+        for (auto& w : workers) count += w.segments[p].size();
+        FlatMap<Segment*> groups(count / 2);
+        for (auto& w : workers) for (auto& seg : w.segments[p]) {
+            auto [head, fresh] = groups.add(seg.name, &seg);
+            if (!fresh) { seg.next = head; head = &seg; }
+        }
+        for (auto& slot : groups.slots()) if (slot.key) dst.shopper.run(slot.key, slot.value, dst.days, dst.campaigns);
+        for (auto& w : workers) std::vector<Segment>().swap(w.segments[p]);
+    }
     void run(const fs::path& data, const fs::path& output) {
         read(data); mark("parse and link");
-        distribute(); mark("deduplicate and partition");
-        parallel(workers.size(), partitions, [&](size_t wi, size_t p) { aggregate(p, workers[wi]); });
+        parallel(workers.size(), partitions, [&](size_t wi, size_t p) { dedup(p, workers[wi]); });
+        mark("deduplicate and partition");
+        parallel(workers.size(), partitions, [&](size_t wi, size_t p) { group_aliases(p, workers[wi]); });
+        parallel(workers.size(), partitions, [&](size_t wi, size_t p) { join_aliases(p, workers[wi]); });
         mark("sessions and attribution");
         fs::create_directories(output / "user_daily");
         fs::create_directories(output / "campaign_daily");

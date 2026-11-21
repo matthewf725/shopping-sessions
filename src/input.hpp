@@ -18,7 +18,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#if defined(__AVX2__)
+#if defined(__SSE2__)
 #include <immintrin.h>
 #elif defined(__ARM_NEON)
 #include <arm_neon.h>
@@ -32,7 +32,7 @@ constexpr Time day_ms = 86'400'000;
 constexpr Time week_ms = 7 * day_ms;
 constexpr Time invalid_time = std::numeric_limits<Time>::min();
 
-struct Chunk { const char* begin; const char* end; };
+struct Chunk { const char* begin; const char* limit; const char* file_end; };
 
 class MappedCsv {
     char* data_ = nullptr;
@@ -55,17 +55,9 @@ public:
     void chunks(std::vector<Chunk>& out) const {
         if (!size_) return;
         const char* end = data_ + size_;
-        auto after_line = [end](const char* p) {
-            const auto* nl = static_cast<const char*>(memchr(p, '\n', end - p));
-            return nl ? nl + 1 : end;
-        };
-        const char* begin = after_line(data_);  // Only the first physical line is a header.
         constexpr size_t target = 512 * 1024;
-        while (begin < end) {
-            const char* stop = size_t(end - begin) > target ? after_line(begin + target) : end;
-            out.push_back({begin, stop});
-            begin = stop;
-        }
+        for (size_t offset = 0; offset < size_; offset += target)
+            out.push_back({data_ + offset, data_ + std::min(offset + target, size_), end});
     }
 };
 
@@ -112,7 +104,7 @@ inline const char* scalar_row(const char* row, const char* end, F& handle) {
     return next;
 }
 
-#if defined(__AVX2__) || defined(__ARM_NEON)
+#if defined(__SSE2__) || defined(__ARM_NEON)
 struct Marks { uint64_t commas, lines, quotes; };
 #if defined(__ARM_NEON)
 inline uint16_t bits16(uint8x16_t v) {
@@ -141,6 +133,15 @@ inline Marks scan64(const char* p) {
         return uint64_t(lo) | (uint64_t(hi) << 32);
     };
     return {mask(','), mask('\n'), mask('"')};
+#elif defined(__SSE2__)
+    Marks m{};
+    for (unsigned i = 0; i < 64; i += 16) {
+        auto v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p + i));
+        m.commas |= uint64_t(_mm_movemask_epi8(_mm_cmpeq_epi8(v, _mm_set1_epi8(',')))) << i;
+        m.lines  |= uint64_t(_mm_movemask_epi8(_mm_cmpeq_epi8(v, _mm_set1_epi8('\n')))) << i;
+        m.quotes |= uint64_t(_mm_movemask_epi8(_mm_cmpeq_epi8(v, _mm_set1_epi8('"')))) << i;
+    }
+    return m;
 #else
     Marks m{};
     for (unsigned i = 0; i < 64; i += 16) {
@@ -154,42 +155,105 @@ inline Marks scan64(const char* p) {
 }
 #endif
 
+#if defined(__SSE2__) || defined(__ARM_NEON)
+inline uint64_t quote_parity(uint64_t q) {
+#if defined(__PCLMUL__)
+    auto v = _mm_clmulepi64_si128(_mm_cvtsi64_si128(q), _mm_set1_epi64x(-1), 0);
+    return uint64_t(_mm_cvtsi128_si64(v));
+#elif defined(__ARM_FEATURE_AES)
+    return vgetq_lane_u64(vreinterpretq_u64_p128(vmull_p64(q, ~uint64_t(0))), 0);
+#else
+    q ^= q << 1; q ^= q << 2; q ^= q << 4;
+    q ^= q << 8; q ^= q << 16; return q ^ (q << 32);
+#endif
+}
+
+// Index a tile with aligned-in-stream, non-overlapping 64-byte scans. Quote
+// parity must be even at every separator, and a quote must touch a field edge.
+// If either check fails, the strict reader recovers each physical line independently.
+struct CsvTile {
+    static constexpr size_t target = 8192;
+    static constexpr size_t slack = 192;
+    std::array<uint16_t, target + slack + 1> separator, line_end;
+    size_t fields = 0, lines = 0;
+    bool index(const char* data, size_t length) {
+        fields = lines = 0;
+        uint64_t carry = 0, starts_field = 1;
+        for (size_t offset = 0; offset < length; offset += 64) {
+            size_t left = length - offset;
+            Marks m;
+            if (left >= 64) m = scan64(data + offset);
+            else {
+                alignas(64) char tail[64]{};
+                memcpy(tail, data + offset, left);
+                m = scan64(tail);
+            }
+            uint64_t ends = m.commas | m.lines;
+            if (m.quotes || carry) {
+                uint64_t next_end = left > 64 && (data[offset + 64] == ',' || data[offset + 64] == '\n');
+                uint64_t adjacent = (ends << 1) | starts_field | (ends >> 1) | (next_end << 63);
+                uint64_t parity = quote_parity(m.quotes) ^ carry;
+                if ((m.quotes & ~adjacent) || (parity & ends)) return false;
+                carry = uint64_t(0) - (parity >> 63);
+            }
+            starts_field = ends >> 63;
+            for (uint64_t nl = m.lines; nl; nl &= nl - 1) {
+                uint64_t first = nl & -nl;
+                line_end[lines++] = uint16_t(fields + std::popcount(ends & (first | (first - 1))));
+            }
+            for (uint64_t bits = ends; bits; bits &= bits - 1)
+                separator[fields++] = uint16_t(offset + std::countr_zero(bits));
+        }
+        return !carry;
+    }
+};
+#endif
+
 template<size_t N, class F>
 void read_rows(Chunk chunk, F&& handle) {
-    auto [row, end] = chunk;
-#if defined(__AVX2__) || defined(__ARM_NEON)
+    // A cut belongs to the preceding chunk through its next newline. Resolve
+    // cuts on the parsing threads, so opening the file never faults in every
+    // 512 KiB boundary serially. At byte zero this also skips the header.
+    const char* boundary = static_cast<const char*>(memchr(chunk.begin, '\n', chunk.limit - chunk.begin));
+    if (!boundary) return;
+    const char* row = boundary + 1;
+    const char* end = chunk.file_end;
+    if (chunk.limit < end) {
+        const char* nl = static_cast<const char*>(memchr(chunk.limit, '\n', end - chunk.limit));
+        if (nl) end = nl + 1;
+    }
+#if defined(__SSE2__) || defined(__ARM_NEON)
+    CsvTile tile;
     while (end - row >= 128) {
-        Marks low = scan64(row), last = low;
-        bool crosses = !low.lines;
-        if (crosses) last = scan64(row + 64);
-        if (!last.lines) { row = scalar_row<N>(row, end, handle); continue; }
-        unsigned last_pos = std::countr_zero(last.lines);
-        unsigned length = last_pos + (crosses ? 64 : 0);
-        uint64_t before = (uint64_t(1) << last_pos) - 1;
-        uint64_t a = crosses ? low.commas : (low.commas & before);
-        uint64_t b = crosses ? (last.commas & before) : 0;
-        if (std::popcount(a) + std::popcount(b) == N - 1) {
-            unsigned quotes = std::popcount(last.quotes & before) + (crosses ? std::popcount(low.quotes) : 0);
-            unsigned start = 0, opens = 0, mismatch = 0;
-            std::array<Text, N> fields;
-            for (size_t i = 0; i < N; ++i) {
-                unsigned finish = length;
-                if (i != N - 1) {
-                    if (a) { finish = std::countr_zero(a); a &= a - 1; }
-                    else { finish = 64 + std::countr_zero(b); b &= b - 1; }
-                }
-                bool open_quote = row[start] == '"';
-                bool close_quote = finish > start && row[finish - 1] == '"';
-                opens += open_quote;
-                mismatch |= (open_quote != close_quote) | (open_quote && finish - start < 2);
-                // A lone quote is rejected below. Clamp the view length even on that path.
-                unsigned trim = open_quote && finish - start >= 2 ? 2 : 0;
-                fields[i] = Text(row + start + open_quote, finish - start - trim);
-                start = finish + 1;
-            }
-            if (!mismatch && quotes == 2 * opens) handle(fields);
+        const char* stop = end;
+        if (size_t(end - row) > CsvTile::target) {
+            const char* search = row + CsvTile::target;
+            const char* nl = static_cast<const char*>(memchr(search, '\n', std::min<size_t>(end - search, CsvTile::slack)));
+            if (!nl) { row = scalar_row<N>(row, end, handle); continue; }
+            stop = nl + 1;
         }
-        row += length + 1;
+        if (stop[-1] != '\n') break;
+        if (!tile.index(row, stop - row)) {
+            while (row < stop) row = scalar_row<N>(row, stop, handle);
+            continue;
+        }
+        size_t first = 0;
+        unsigned start = 0;
+        for (size_t line = 0; line < tile.lines; ++line) {
+            size_t next = tile.line_end[line];
+            if (next - first == N) {
+                std::array<Text, N> fields;
+                for (size_t k = 0; k < N; ++k) {
+                    unsigned finish = tile.separator[first + k];
+                    unsigned quote = row[start] == '"';
+                    fields[k] = Text(row + start + quote, finish - start - quote * 2);
+                    start = finish + 1;
+                }
+                handle(fields);
+            } else start = tile.separator[next - 1] + 1;
+            first = next;
+        }
+        row = stop;
     }
 #endif
     while (row < end) row = scalar_row<N>(row, end, handle);
@@ -259,18 +323,36 @@ public:
     template<bool trusted = false>
     Time iso(Text s) const {
         const char* p = s.data();
-        if constexpr (!trusted) {
-            if (p[10] != 'T' || p[13] != ':' || p[16] != ':' || !digits2(p+8) ||
-                !digits2(p+11) || !digits2(p+14) || !digits2(p+17)) return invalid_time;
-        }
         uint64_t prefix;
         memcpy(&prefix, p, 8);
         Month m = months_[slot(p)];
         if (m.prefix != prefix || !m.days) m = month(p);
-        int d = pair_value(p+8), h = pair_value(p+11), min = pair_value(p+14), sec = pair_value(p+17);
+        int d, seconds_of_day;
+#if defined(__SSSE3__) && defined(__SSE4_1__)
+        // Gather DD hh mm ss with one shuffle. PMADDUBSW evaluates all four
+        // decimal pairs at once on the scorer's Xeons. This load ends at byte 19.
+        auto raw = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p + 4));
+        auto positions = _mm_setr_epi8(4,5,7,8,10,11,13,14, -1,-1,-1,-1,-1,-1,-1,-1);
+        auto digits = _mm_shuffle_epi8(_mm_sub_epi8(raw, _mm_set1_epi8('0')), positions);
+        auto pairs = _mm_maddubs_epi16(digits, _mm_set1_epi16(0x010a));
+        d = _mm_extract_epi16(pairs, 0);
+        auto parts = _mm_madd_epi16(pairs, _mm_setr_epi16(0,3600,60,1,0,0,0,0));
+        seconds_of_day = _mm_cvtsi128_si32(parts) + _mm_extract_epi32(parts, 1);
         if constexpr (!trusted) {
-            if (d < 1 || d > m.days || h > 23 || min > 59 || sec > 59) return invalid_time;
+            auto bad_digits = _mm_subs_epu8(digits, _mm_set1_epi8(9));
+            auto limits = _mm_setr_epi16(short(m.days),23,59,59,0,0,0,0);
+            auto bad = _mm_or_si128(bad_digits, _mm_cmpgt_epi16(pairs, limits));
+            if (!_mm_testz_si128(bad, bad) || !d || p[10] != 'T' || p[13] != ':' || p[16] != ':') return invalid_time;
         }
+#else
+        d = pair_value(p+8);
+        int h = pair_value(p+11), min = pair_value(p+14), sec = pair_value(p+17);
+        if constexpr (!trusted) {
+            if (p[10] != 'T' || p[13] != ':' || p[16] != ':' || !digits2(p+8) || !digits2(p+11) ||
+                !digits2(p+14) || !digits2(p+17) || d < 1 || d > m.days || h > 23 || min > 59 || sec > 59) return invalid_time;
+        }
+        seconds_of_day = (h * 60 + min) * 60 + sec;
+#endif
         int offset = 0;
         if constexpr (!trusted) {
             if (s.size() == 20) { if (p[19] != 'Z') return invalid_time; }
@@ -281,7 +363,7 @@ public:
                 offset = (p[19] == '+' ? 1 : -1) * (oh * 60 + om);
             }
         }
-        return (Time(m.first) + d - 1) * day_ms + ((h * 60 + min - offset) * 60 + sec) * 1000LL;
+        return (Time(m.first) + d - 1) * day_ms + (seconds_of_day - offset * 60) * 1000LL;
     }
     Time parse(Text s) const {
         if (s.size() == 13) return epoch13(s.data());

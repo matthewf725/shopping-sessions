@@ -1,7 +1,7 @@
 """Compare the native executable against a chronological, brute-force reference."""
 import argparse
 from collections import Counter, defaultdict
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
@@ -155,6 +155,14 @@ def adversarial(data, years):
     for i, offset in enumerate((0, GAP, GAP*2+1, 3*GAP+1, 3*GAP+2, DAY-1, DAY, DAY+GAP)):
         ts = base + offset
         events.append((f'ex{i}', 'other', str(ts), iso(ts), 'view', 'q', 'bad'))
+    # Compacted records must preserve ingestion precedence even outside the compact date range.
+    events.extend([
+        ('efar', 'other', str(base), '1970-01-01T00:00:00Z', 'view', 'p1', ''),
+        ('efar', 'u1', str(base), iso(base), 'purchase', 'p2', '900'),
+        ('ebad', 'other', 'broken', '1970-01-01T00:00:00Z', 'view', 'p1', ''),
+        ('ebad', 'u1', str(base), iso(base), 'purchase', 'p2', '500'),
+        ('elate', 'other', str(base), '2140-01-02T00:00:00Z', 'view', 'p1', ''),
+    ])
     data_sets = {'events': ('event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents', events),
                  'clicks': ('click_id,user_id,campaign_id,ts', clicks), 'links': ('user_id_a,user_id_b', links)}
     for name, (header, rows) in data_sets.items():
@@ -165,6 +173,23 @@ def adversarial(data, years):
                 print(header, file=f)
                 for row in rows[i::3]:
                     print(','.join('"'+v+'"' if r.randrange(2) else v for v in row), file=f)
+
+
+def chunk_boundaries(data):
+    data.mkdir()
+    start = '2025-01-01T00:00:00Z'
+    (data / 'manifest.json').write_text(json.dumps({'window_start': start, 'window_end': '2025-01-02T00:00:00Z'}))
+    (data / 'products.csv').write_text('product_id,category\np1,books\n')
+    (data / 'campaigns.csv').write_text('campaign_id,channel\nc_1,email\n')
+    for folder in ('events', 'clicks', 'links'):
+        (data / folder).mkdir()
+    header = 'event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents\n'
+    for i, delta in enumerate((-1, 0, 1)):
+        first = f'e{i}a,u1,{start},{start},view,p1,'
+        tail = f'e{i}b,u1,{start},{start},purchase,p1,091'
+        pad = 'x' * (512 * 1024 + delta - len(header) - len(first))
+        giant = f'e{i}c,u1,{start},{start},view,p1,' + 'x' * (2 * 512 * 1024 + 7)
+        (data / 'events' / f'{i}.csv').write_text(header + first + pad + '\n' + giant + '\n' + tail)
 
 
 def check(exe, data, output):
@@ -186,6 +211,9 @@ if __name__ == '__main__':
             data = root / ('wide' if years else 'dense')
             adversarial(data, years)
             check(args.pipeline.resolve(), data, root / (data.name+'-out'))
+        data = root / 'chunk-boundaries'
+        chunk_boundaries(data)
+        check(args.pipeline.resolve(), data, root / 'chunk-out')
         if args.generator:
             for seed in (0, 3, 11, 19, 47, 2147483661):
                 data = root / f'seed-{seed}'

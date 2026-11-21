@@ -133,9 +133,9 @@ public:
         });
         for (auto& slot : entries_.slots()) if (slot.key) slot.value = nodes[root(uint32_t(slot.value))].name;
     }
-    Key resolve(Key key) const {
+    Key linked_name(Key key) const {
         const auto* name = entries_.get(key);
-        return name ? *name : key;
+        return name ? *name : 0;
     }
 };
 
