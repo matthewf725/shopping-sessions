@@ -26,6 +26,7 @@ run() (
     grep -m1 'model name' /proc/cpuinfo
     grep -m1 '^flags' /proc/cpuinfo
     echo "SHOP_SIM_CPUS $(grep -c '^processor' /proc/cpuinfo)"
+    grep '^MemTotal:' /proc/meminfo
     mkdir -p /result
     export NCPU=8 LD_LIBRARY_PATH=/opt/arrow/lib
     if [ -f /shop-profile ]; then export PROFILE=1; fi

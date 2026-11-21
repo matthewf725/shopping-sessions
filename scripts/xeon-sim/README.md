@@ -42,6 +42,8 @@ python3 scripts/xeon-sim/run.py --data practice=/path/to/practice \
     --output .bench/xeon-practice
 ```
 
+To expose 24 GiB to Linux, pass `--memory-mib 24576 --resident-mib 6144`. Bochs 3.1 keeps up to 8192 MiB of guest pages in host RAM and can page additional blocks to a temporary file. With these settings, Linux reported eight CPUs and 24,608,556 KiB of usable memory. The scored build matched both million-event reference tables. The calibration and paired practice runs below used 6144 MiB of guest RAM.
+
 `run.json` identifies the binaries, kernel, emulator and staged input disk by SHA-256 and records the guest configuration. `counts.json` records the instructions executed by all guest CPUs from immediately before fork to immediately after wait, including Linux kernel work inside that interval. `virtual_ticks` records the Bochs scheduler's time units. `guest.log` contains feature checks, exit markers and optional pipeline stage readings from `--profile`. The output directory retains both final Parquet tables per binary and dataset. A failed child, missing marker or missing table makes the command fail.
 
 The official measurement includes fresh-container startup and exit. Bochs executes instructions functionally and uses an instruction-based clock. Its figures omit native cache and memory stalls, AVX frequency changes and container startup. Changing `ips` changes the guest clock. Only the scorer measures the contest time. [Bochs clock configuration](https://bochs.sourceforge.io/doc/docbook/user/bochsrc.html) · [Builders scoring](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions)
@@ -58,7 +60,28 @@ Both Linux executables were built with Debian GCC 12.2 and Arrow 21 using the fl
 
 The first two rows use medians from alternating run orders. The single practice-size comparison put the estimate 0.062 s above the official result. One comparison gives no error bound for another implementation or input. Both million-event outputs matched the organizer's 117,038 user-day rows and 27,400 campaign-day rows. At practice size the two builds matched on all 2,251,704 user-day rows and 28,014 campaign-day rows. The accounting check agreed across all 14 days and 3,420,024 sessions.
 
-On a separate profiled million-event run of `1018e64`, parsing and linking used 58.2% of the guest time measured inside main, setup 15.4%, sessions and attribution 12.4%, Parquet output 8.3%, and deduplication and partitioning 5.7%. These shares depend on the simulated machine and input size.
+Profiled runs of `1018e64` gave these shares of guest time from entry to main through output close. Each practice column uses the same 20M-event seed in a separate guest. The last column ran after another build had processed the same input.
+
+| Stage | 1M events, seed 1 | 20M, first process | 20M, second process |
+| --- | ---: | ---: | ---: |
+| Parsing and identity linking | 58.2% | 70.1% | 67.0% |
+| Sessions and attribution | 12.4% | 17.6% | 19.4% |
+| Deduplication and partitioning | 5.7% | 8.0% | 8.9% |
+| Writing Parquet | 8.3% | 3.1% | 3.4% |
+| Setup | 15.4% | 1.2% | 1.3% |
+
+### A timestamp optimization and the effect of run order
+
+A trial used BMI2 `PEXT` to pack the six digits of `HH:MM:SS`, then indexed three 256-entry tables containing hour, minute and second contributions. It passed 1,008,192 exact clock comparisons, all 36 organizer fixtures and the million-event reference.
+
+With `PROFILE=1` in both binaries, the trial appeared to save 6.2% of total instructions when the scored build ran first and the trial ran second. Reversing the order in a fresh guest enabled comparisons at the same position on the same practice seed.
+
+| Position in the guest | Scored build | Clock-table trial | Instruction reduction |
+| --- | ---: | ---: | ---: |
+| First | 30,620,875,815 | 30,576,212,878 | 0.15% |
+| Second | 28,848,477,365 | 28,724,288,620 | 0.43% |
+
+The geometric mean of the two matched ratios gives a 0.29% reduction. Both builds produced the same daily tables. The official submission remains `1018e64`.
 
 ## Model an individual loop
 

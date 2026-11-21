@@ -130,7 +130,8 @@ def simulate(args, work):
     source = disk_geometry(work / "input.raw", (work / "input.raw").stat().st_size)
     metadata = {
         "cpu_model": CPU_MODEL, "sockets": 1, "cores_per_socket": 4, "threads_per_core": 2,
-        "memory_mib": args.memory_mib, "profile": args.profile, "repeats": args.repeat,
+        "memory_mib": args.memory_mib, "resident_mib": args.resident_mib,
+        "profile": args.profile, "repeats": args.repeat,
         "datasets": [name for name, _ in args.data],
         "binary_sha256": {name: sha256(file) for name, file in programs},
         "input_disk_sha256": sha256(work / "input.raw"),
@@ -142,7 +143,7 @@ def simulate(args, work):
         output_disk.write(b"SHOP_OUTPUT_V1")
     serial = work / "serial.log"
     config = work / "bochsrc"
-    config.write_text(f'''megs: {args.memory_mib}
+    config.write_text(f'''memory: guest={args.memory_mib}, host={args.resident_mib}
 romimage: file="{assets / 'bios.bin'}"
 vgaromimage: file="{assets / 'vgabios.bin'}"
 display_library: nogui
@@ -212,6 +213,8 @@ def main():
     parser.add_argument("--profile", action="store_true",
                         help="enable pipeline stage timings from the guest's virtual clock")
     parser.add_argument("--memory-mib", type=int, default=1024)
+    parser.add_argument("--resident-mib", type=int,
+                        help="host RAM budget for guest pages, up to 8192 MiB in Bochs 3.1")
     parser.add_argument("--output-mib", type=int, default=64)
     parser.add_argument("--timeout", type=int, default=1800)
     parser.add_argument("--work-dir", type=Path, help="parent directory for temporary guest disks")
@@ -219,6 +222,11 @@ def main():
     args = parser.parse_args()
     if min(args.repeat, args.memory_mib, args.output_mib, args.timeout) < 1:
         parser.error("all sizes, repeat and timeout must be positive")
+    max_resident = min(args.memory_mib, 8192)
+    if args.resident_mib is None:
+        args.resident_mib = max_resident
+    elif not 1 <= args.resident_mib <= max_resident:
+        parser.error(f"--resident-mib must be between 1 and {max_resident}")
     args.output = args.output.resolve()
     args.output.mkdir(parents=True, exist_ok=False)
     with tempfile.TemporaryDirectory(prefix="shop-bochs-", dir=args.work_dir) as tmp:
