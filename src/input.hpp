@@ -295,11 +295,7 @@ inline size_t scan_csv_tile(const char* data, size_t length, Sink& sink) {
 
 template<size_t N>
 struct CsvTile {
-#if defined(__AVX512BW__)
-    static constexpr unsigned target = 32768, slack = 192;
-#else
     static constexpr unsigned target = 8192, slack = 192;
-#endif
     static_assert(target + slack < UINT16_MAX);
     static constexpr unsigned words = (target + slack + 63) / 64;
     static constexpr uint16_t wrong_columns = 0x8000;
@@ -428,7 +424,7 @@ struct CsvTile {
 // consecutive slots, regardless of quoted fields, length, or timestamp form.
 template<size_t N>
 struct OffsetTile {
-    static constexpr unsigned target = CsvTile<N>::target;
+    static constexpr unsigned target = 32768;
     static constexpr unsigned slack = CsvTile<N>::slack;
     std::array<uint32_t, target + slack + 1> offsets;
     std::array<uint16_t, (target + slack) / N + 1> rows;
@@ -521,7 +517,7 @@ inline const char* last_complete_line(const char* first, const char* stop) {
 }
 #endif
 
-template<size_t N, class F, class Project = std::nullptr_t>
+template<size_t N, bool Bitmap = false, class F, class Project = std::nullptr_t>
 void read_rows(Chunk chunk, F&& handle, Project project = nullptr) {
     // A cut belongs to the preceding chunk through its next newline. Resolve
     // cuts on the parsing threads, so opening the file never faults in every
@@ -536,15 +532,15 @@ void read_rows(Chunk chunk, F&& handle, Project project = nullptr) {
     }
 #if defined(__SSE2__) || defined(__ARM_NEON)
 #if defined(__AVX512BW__)
-    OffsetTile<N> tile;
+    std::conditional_t<Bitmap, CsvTile<N>, OffsetTile<N>> tile;
 #else
     CsvTile<N> tile;
 #endif
     while (row < end) {
         const char* stop = end;
-        if (size_t(end - row) > CsvTile<N>::target) {
-            const char* search = row + CsvTile<N>::target;
-            const char* nl = static_cast<const char*>(memchr(search, '\n', std::min<size_t>(end - search, CsvTile<N>::slack)));
+        if (size_t(end - row) > decltype(tile)::target) {
+            const char* search = row + decltype(tile)::target;
+            const char* nl = static_cast<const char*>(memchr(search, '\n', std::min<size_t>(end - search, decltype(tile)::slack)));
             stop = nl ? nl + 1 : last_complete_line(row, search);
             if (stop == row) { row = scalar_row<N>(row, end, handle); continue; }
         } else if (stop[-1] != '\n') {

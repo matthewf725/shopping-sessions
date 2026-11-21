@@ -2,12 +2,16 @@
 #include "blocks.hpp"
 #include "buffered.hpp"
 #include "avx_events.hpp"
+#if defined(__AVX512CD__)
+#include "parser_choice.hpp"
+#endif
 #include <atomic>
 #include <cstdlib>
 #include <ctime>
 #include <functional>
 #include <iostream>
 #include <thread>
+#include <sys/resource.h>
 
 namespace shop {
 constexpr unsigned partition_bits = 8;
@@ -123,7 +127,7 @@ struct Pipeline {
         Key id_hash = hash_key(id);
         w.parsed.append(hash_partition(id_hash), {id_hash, person, event});
     }
-    void parse_events(Chunk chunk, Worker& w) {
+    void parse_events(Chunk chunk, Worker& w, unsigned mode = 0) {
         auto consume = [&](Text eid, Text person, Text time, Text ingest, Text kind, bool has_product, auto purchase) {
             Key id = events.encode(eid);
             if (!id || ingest.size() != 20) return;
@@ -145,7 +149,12 @@ struct Pipeline {
             // Keep invalid copies by event ID so the earliest ingestion still wins.
             store_event(w, id, valid ? users.encode(person) : 0, ts, arrival.order, price, category);
         };
+        auto fields = [&](const auto& f) {
+            consume(f[0], f[1], f[2], f[3], f[4], !f[5].empty(), [&] { return std::pair{f[5], f[6]}; });
+        };
 #if defined(__AVX512BW__) && defined(__AVX512DQ__) && defined(__AVX512VL__) && defined(__AVX512CD__)
+        if (mode == 1) { read_rows<7>(chunk, fields, consume); return; }
+        if (mode == 2) { read_rows<7, true>(chunk, fields, consume); return; }
         auto accelerate = [&](const char *data, const uint32_t *offsets, const uint16_t *rows,
                               unsigned active = 255) {
             auto append = [&](Key id, Key person, uint64_t packed) {
@@ -163,11 +172,9 @@ struct Pipeline {
 #else
         auto& projection = consume;
 #endif
-        read_rows<7>(chunk, [&](const auto& f) {
-            consume(f[0], f[1], f[2], f[3], f[4], !f[5].empty(), [&] { return std::pair{f[5], f[6]}; });
-        }, projection);
+        read_rows<7>(chunk, fields, projection);
     }
-    void parse_clicks(Chunk chunk, Worker& w) {
+    void parse_clicks(Chunk chunk, Worker& w, unsigned mode = 0) {
         auto consume = [&](const auto& f) {
             if (f[0].empty() || f[1].empty()) return;
             uint32_t campaign = dim.campaigns.get(f[2]);
@@ -178,6 +185,8 @@ struct Pipeline {
             w.clicks.append(partition(raw_user), {raw_user, {ts, click_keys.encode(f[0]), campaign}});
         };
 #if defined(__AVX512BW__) && defined(__AVX512DQ__) && defined(__AVX512VL__) && defined(__AVX512CD__)
+        if (mode == 1) { read_rows<4>(chunk, consume); return; }
+        if (mode == 2) { read_rows<4, true>(chunk, consume); return; }
         auto accelerate = [&](const char *data, const uint32_t *offsets, const uint16_t *rows,
                               unsigned active = 255) {
             return ClickLanes::parse(
@@ -191,6 +200,13 @@ struct Pipeline {
 #else
         read_rows<4>(chunk, consume);
 #endif
+    }
+    static long input_blocks() {
+#if defined(__linux__)
+        struct rusage usage{};
+        if (getrusage(RUSAGE_THREAD, &usage) == 0) return usage.ru_inblock;
+#endif
+        return 0;
     }
     void read(const fs::path& data) {
         CsvPieces ev(data / "events"), ck(data / "clicks");
@@ -217,12 +233,57 @@ struct Pipeline {
         for (auto &w : workers) {
             preallocate(w.details, per_worker / 1600);
         }
-        size_t click_start = 1 + ev.chunks.size();
-        parallel(workers.size(), click_start + ck.chunks.size(), [&](size_t wi, size_t job) {
-            if (job == 0) people.build(links, users);
-            else if (job < click_start) parse_events(inputs[wi].read(ev.chunks[job - 1]), workers[wi]);
-            else parse_clicks(inputs[wi].read(ck.chunks[job - click_start]), workers[wi]);
+        const size_t click_start = 1 + ev.chunks.size();
+        const size_t jobs = click_start + ck.chunks.size();
+        std::atomic<size_t> next{0};
+        std::atomic<bool> reading_blocks{false};
+#if defined(__AVX512CD__)
+        ParserChoice event_reader, click_reader;
+#endif
+        parallel(workers.size(), workers.size(), [&](size_t wi, size_t) {
+            auto& input = inputs[wi];
+            auto& worker = workers[wi];
+            // Sampling measures this thread's completed filesystem reads. On a storage miss,
+            // reserving consecutive chunks gives Linux a sequential stream for this descriptor.
+            unsigned pieces = 0;
+            for (;;) {
+                bool from_storage = reading_blocks.load(std::memory_order_relaxed);
+                size_t stride = from_storage ? 8 : 1;
+                size_t first = next.fetch_add(stride, std::memory_order_relaxed);
+                if (first >= jobs) break;
+                size_t stop = std::min(first + stride, jobs);
+                for (size_t j = first; j < stop; ++j) {
+                    if (j == 0) {
+                        people.build(links, users);
+                        continue;
+                    }
+                    bool event = j < click_start;
+                    const FilePiece& piece = event ? ev.chunks[j - 1] : ck.chunks[j - click_start];
+                    bool sample = !from_storage && ((pieces++ & 31) == 0);
+                    long before = sample ? input_blocks() : 0;
+                    Chunk chunk = input.read(piece);
+                    if (sample && input_blocks() > before) {
+                        reading_blocks.store(true, std::memory_order_relaxed);
+                        from_storage = true;
+                    }
+#if defined(__AVX512CD__)
+                    size_t bytes = size_t(chunk.limit - chunk.begin);
+                    if (event) event_reader.run(bytes, [&](unsigned mode) { parse_events(chunk, worker, mode); });
+                    else click_reader.run(bytes, [&](unsigned mode) { parse_clicks(chunk, worker, mode); });
+#else
+                    if (event) parse_events(chunk, worker);
+                    else parse_clicks(chunk, worker);
+#endif
+                }
+            }
         });
+#if defined(__AVX512CD__)
+        if (std::getenv("PROFILE"))
+            std::fprintf(stderr, "selected_event_reader %u selected_click_reader %u\n",
+                         event_reader.selected(), click_reader.selected());
+#endif
+        if (std::getenv("PROFILE"))
+            std::fprintf(stderr, "input_block_io %d\n", int(reading_blocks.load()));
     }
     int64_t ingest_order(PackedEvent e) const {
         if (e.tag & detailed) return workers[e.tag ^ detailed].details[e.when].ingest_order;

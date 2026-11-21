@@ -69,8 +69,10 @@ public:
         return uint32_t(n);
     }
     template <class T> static void write_le(uint8_t* p, T n) {
-        if constexpr (std::endian::native == std::endian::big) {
-            if constexpr (sizeof(T) == 4)
+        if constexpr (std::endian::native == std::endian::big && sizeof(T) > 1) {
+            if constexpr (sizeof(T) == 2)
+                n = T(__builtin_bswap16(uint16_t(n)));
+            else if constexpr (sizeof(T) == 4)
                 n = T(__builtin_bswap32(uint32_t(n)));
             else
                 n = T(__builtin_bswap64(uint64_t(n)));
@@ -127,7 +129,9 @@ constexpr Column campaign_schema[] = {{"campaign_id", Storage::text, 0},
                                       {"revenue_cents", Storage::integer64},
                                       {"assisted_sessions", Storage::integer64}};
 struct ChunkLocation {
-    uint64_t start, bytes;
+    uint64_t start{}, bytes{}, dictionary{};
+    uint8_t encoding{};
+
 };
 struct Group {
     size_t rows;
@@ -156,10 +160,10 @@ class File {
         container.field(3, structure);
         Fields m{header_};
         m.number(1, i32, unsigned(c.storage));
-        m.sequence(2, i32, c.nullable ? 2 : 1);
-        header_.integer(0);
-        if (c.nullable)
-            header_.integer(3);
+        m.sequence(2, i32, 1 + unsigned(c.nullable || chunk.dictionary) + unsigned(chunk.dictionary != 0));
+        header_.integer(chunk.encoding);
+        if (c.nullable || chunk.dictionary) header_.integer(3);
+        if (chunk.dictionary) header_.integer(0);
         m.sequence(3, binary, 1);
         header_.thrift_string(c.name);
         m.number(4, i32, 0);
@@ -167,6 +171,7 @@ class File {
         m.number(6, i64, chunk.bytes);
         m.number(7, i64, chunk.bytes);
         m.number(9, i64, chunk.start);
+        if (chunk.dictionary) m.number(11, i64, chunk.dictionary);
         m.end();
         container.end();
     }
@@ -183,7 +188,28 @@ public:
         groups_.push_back({rows});
         rows_ += rows;
     }
-    void column(size_t index) {
+    void dictionary(size_t index, size_t entries) {
+        auto& g = groups_.back();
+        auto& chunk = g.columns[index];
+        const auto bytes = Bytes::narrow(page.size());
+        header_.reset(48);
+        Fields head{header_};
+        head.number(1, i32, 2);
+        head.number(2, i32, bytes);
+        head.number(3, i32, bytes);
+        head.field(7, structure);
+        Fields dictionary{header_};
+        dictionary.number(1, i32, entries);
+        dictionary.number(2, i32, 0);
+        dictionary.end();
+        head.end();
+        chunk.dictionary = offset_;
+        chunk.bytes = header_.size() + bytes;
+        g.bytes += chunk.bytes;
+        write(header_.data(), header_.size());
+        write(page.data(), page.size());
+    }
+    void column(size_t index, uint8_t encoding = 0) {
         auto& g = groups_.back();
         unsigned bytes = Bytes::narrow(page.size());
         header_.reset(80);
@@ -194,14 +220,16 @@ public:
         head.field(5, structure);
         Fields d{header_};
         d.number(1, i32, g.rows);
-        d.number(2, i32, 0);
+        d.number(2, i32, encoding);
         d.number(3, i32, 3);
         d.number(4, i32, 3);
         d.end();
         head.end();
         auto& loc = g.columns[index];
-        loc = {offset_, header_.size() + bytes};
-        g.bytes += loc.bytes;
+        loc.start = offset_;
+        loc.bytes += header_.size() + bytes;
+        loc.encoding = encoding;
+        g.bytes += header_.size() + bytes;
         write(header_.data(), header_.size());
         write(page.data(), page.size());
     }
@@ -211,6 +239,73 @@ public:
         for (size_t i = 0; i < n; ++i)
             Bytes::write_le(dest + i * sizeof(T), T(get(i)));
         column(index);
+    }
+    // Parquet DELTA_BINARY_PACKED uses 128 differences per block and 32 per miniblock.
+    // Subtract in the unsigned domain so all signed 32- and 64-bit inputs round-trip.
+    template<class T, class Getter>
+    void delta_numbers(size_t index, size_t n, Getter get) {
+        using U = std::make_unsigned_t<T>;
+        auto zigzag = [](T value) {
+            U u = std::bit_cast<U>(value);
+            return U((u << 1) ^ (U(0) - (u >> (8 * sizeof(T) - 1))));
+        };
+        page.reset(n * sizeof(T) + n / 8 + 64);
+        page.varint(128);
+        page.varint(4);
+        page.varint(n);
+        T previous = T(get(0));
+        page.varint(zigzag(previous));
+        for (size_t begin = 1; begin < n; begin += 128) {
+            size_t count = std::min<size_t>(128, n - begin);
+            std::array<T, 128> deltas;
+            T minimum = std::numeric_limits<T>::max();
+            for (size_t i = 0; i < count; ++i) {
+                T value = T(get(begin + i));
+                T diff = std::bit_cast<T>(U(U(value) - U(previous)));
+                deltas[i] = diff;
+                minimum = std::min(minimum, diff);
+                previous = value;
+            }
+            page.varint(zigzag(minimum));
+            size_t widths = page.size();
+            std::memset(page.append(4), 0, 4);
+            size_t padded = (count + 31) / 32 * 32;
+            std::fill(deltas.begin() + count, deltas.begin() + padded, minimum);
+            for (size_t j = 0; j < count; j += 32) {
+                alignas(64) U residual[32];
+                U all = 0;
+                for (unsigned i = 0; i < 32; ++i) {
+                    residual[i] = U(deltas[j+i]) - U(minimum);
+                    all |= residual[i];
+                }
+                if (!all) continue;
+                unsigned width = std::bit_ceil(unsigned(std::bit_width(all)));
+                page.data()[widths + j / 32] = uint8_t(width);
+                auto* dst = page.append(4 * width);
+                auto packed = [&]<unsigned Bits>() {
+                    for (unsigned i = 0; i < 32; i += 8 / Bits) {
+                        unsigned byte = 0;
+                        for (unsigned k = 0; k < 8 / Bits; ++k)
+                            byte |= unsigned(residual[i + k]) << (k * Bits);
+                        *dst++ = uint8_t(byte);
+                    }
+                };
+                auto bytes = [&]<class Word>() {
+                    for (unsigned i = 0; i < 32; ++i)
+                        Bytes::write_le(dst + sizeof(Word) * i, Word(residual[i]));
+                };
+                switch (width) {
+                    case 1: packed.template operator()<1>(); break;
+                    case 2: packed.template operator()<2>(); break;
+                    case 4: packed.template operator()<4>(); break;
+                    case 8: bytes.template operator()<uint8_t>(); break;
+                    case 16: bytes.template operator()<uint16_t>(); break;
+                    case 32: bytes.template operator()<uint32_t>(); break;
+                    case 64: bytes.template operator()<uint64_t>(); break;
+                }
+            }
+        }
+        column(index, 5);
     }
     void close() {
         header_.reset();
@@ -266,6 +361,8 @@ void write_users(const fs::path& path, const UserDays& rows, const Keys& users,
     for (const auto& category : dimensions.categories)
         width = std::max(width, category.size());
     const size_t group_rows = rows_per_group(width);
+    struct PersonRun { Key person; uint32_t length; };
+    std::vector<PersonRun> runs;
     for (size_t base = 0; base < rows.size();) {
         auto group = rows.range(base, group_rows);
         const auto* row = group.data();
@@ -273,21 +370,39 @@ void write_users(const fs::path& path, const UserDays& rows, const Keys& users,
         base += n;
         f.group(n);
         auto& data = f.page;
-        data.reset(n * 13);
-        Key previous = 0;
-        std::string id;
-        for (size_t i = 0; i < n; ++i) {
-            if (row[i].person != previous) {
-                previous = row[i].person;
-                id = users.decode(previous);
-            }
-            data.plain_string(id);
+        runs.clear();
+        for (size_t first = 0; first < n;) {
+            size_t stop = first + 1;
+            while (stop < n && row[stop].person == row[first].person) ++stop;
+            runs.push_back({row[first].person, uint32_t(stop - first)});
+            first = stop;
         }
-        f.column(0);
-        f.numbers<int32_t>(1, n, [&](size_t i) { return row[i].day; });
-        f.numbers<int32_t>(2, n, [&](size_t i) { return row[i].sessions; });
-        f.numbers<int32_t>(3, n, [&](size_t i) { return row[i].events; });
-        f.numbers<int64_t>(4, n, [&](size_t i) { return row[i].revenue; });
+        // One shopper produces all of their days in one consecutive range.
+        if (runs.size() * 6 < n * 5) {
+            data.reset(runs.size() * 13);
+            for (const auto& run : runs) data.plain_string(users.decode(run.person));
+            f.dictionary(0, runs.size());
+            data.reset(1 + runs.size() * 4);
+            const unsigned bits = std::max<unsigned>(1, std::bit_width(uint32_t(runs.size() - 1)));
+            data.byte(uint8_t(bits));
+            for (size_t i = 0; i < runs.size(); ++i) {
+                data.varint(runs[i].length * 2);
+                data.byte(uint8_t(i));
+                if (bits > 8) data.byte(uint8_t(i >> 8));
+            }
+            f.column(0, 8);
+        } else {
+            data.reset(n * 13);
+            for (const auto& run : runs) {
+                auto id = users.decode(run.person);
+                for (size_t j = 0; j < run.length; ++j) data.plain_string(id);
+            }
+            f.column(0);
+        }
+        f.delta_numbers<int32_t>(1, n, [&](size_t i) { return row[i].day; });
+        f.delta_numbers<int32_t>(2, n, [&](size_t i) { return row[i].sessions; });
+        f.delta_numbers<int32_t>(3, n, [&](size_t i) { return row[i].events; });
+        f.delta_numbers<int64_t>(4, n, [&](size_t i) { return row[i].revenue; });
         size_t groups = (n + 7) / 8;
         data.reset(12 + groups + n * 3);
         data.append(4);
