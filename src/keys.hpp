@@ -14,6 +14,14 @@ inline uint64_t hash_key(Key k) {
     return k ^ (k >> 32);
 }
 
+inline uint64_t table_hash(Key key) {
+#if defined(__x86_64__) && defined(__SSE4_2__)
+    return _mm_crc32_u64(0, key);
+#else
+    return hash_key(key);
+#endif
+}
+
 // Direct keys are the exact suffix bytes in lexical order, padded with zeroes.
 // Spellings that cannot be represented this way get disjoint interned keys.
 class Keys {
@@ -71,7 +79,7 @@ public:
     }
 };
 
-template<class T, auto bucket_hash = hash_key>
+template<class T, auto bucket_hash = table_hash>
 class FlatMap {
 public:
     struct Slot { Key key{}; T value{}; };

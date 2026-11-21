@@ -1,4 +1,5 @@
 #include "output.hpp"
+#include "blocks.hpp"
 #include "avx_events.hpp"
 #include <atomic>
 #include <cstdlib>
@@ -8,8 +9,10 @@
 #include <thread>
 
 namespace shop {
-constexpr size_t partitions = 256;
-inline size_t partition(Key key) { return hash_key(key) >> 56; }
+constexpr unsigned partition_bits = 6;
+constexpr size_t partitions = size_t{1} << partition_bits;
+inline size_t hash_partition(uint64_t hash) { return hash >> (64 - partition_bits); }
+inline size_t partition(Key key) { return hash_partition(hash_key(key)); }
 // Views and carts need only two words beyond their IDs. Purchases and unusual
 // date ranges point into their parser worker's exact, immutable detail array.
 constexpr uint32_t detailed = 0x80000000u;
@@ -17,13 +20,21 @@ struct PackedEvent { uint32_t when, tag; };
 struct Detail { int64_t ingest_order; Event event; };
 struct RawEvent { Key id_hash, person; PackedEvent event; };
 static_assert(sizeof(RawEvent) == 24);
-template<class T> struct Owned { Key person; T value; };
+struct RawGroup {
+    Key key = 0;
+    size_t events = 0, clicks = 0;
+    RawGroup* next = nullptr;
+};
+template<class T> struct Owned {
+    union { Key person; RawGroup* group; };
+    T value;
+};
 using OwnedEvent = Owned<PackedEvent>;
 using OwnedClick = Owned<Click>;
 struct Worker {
     uint32_t number;
     std::vector<Detail> details;
-    std::array<std::vector<RawEvent>, partitions> parsed;
+    ShardedBlocks<RawEvent, partitions> parsed;
     std::array<std::vector<Segment>, partitions> segments;
     std::array<std::vector<OwnedEvent>, partitions> events;
     std::array<std::vector<OwnedClick>, partitions> clicks;
@@ -111,7 +122,7 @@ struct Pipeline {
         // Both xor-shifts and multiplication by an odd number are invertible
         // on 64 bits. This hash is an exact event ID, and zero stays reserved.
         Key id_hash = hash_key(id);
-        w.parsed[id_hash >> 56].push_back({id_hash, person, event});
+        w.parsed.append(hash_partition(id_hash), {id_hash, person, event});
     }
     void parse_events(Chunk chunk, Worker& w) {
         auto consume = [&](Text eid, Text person, Text time, Text ingest, Text kind, bool has_product, auto purchase) {
@@ -138,7 +149,7 @@ struct Pipeline {
 #if defined(__AVX512BW__) && defined(__AVX512DQ__) && defined(__AVX512VL__)
         auto accelerate = [&](const char* data, const uint32_t* offsets, const uint16_t* rows) {
             return EventLanes::run(window, data, offsets, rows, [&](Key id, Key person, uint64_t packed) {
-                w.parsed[id >> 56].push_back({id, person, {uint32_t(packed), uint32_t(packed >> 32)}});
+                w.parsed.append(hash_partition(id), {id, person, {uint32_t(packed), uint32_t(packed >> 32)}});
             });
         };
         auto projection = BatchProjection{consume, accelerate};
@@ -162,8 +173,8 @@ struct Pipeline {
 #if defined(__AVX512BW__) && defined(__AVX512DQ__) && defined(__AVX512VL__)
         auto accelerate = [&](const char* data, const uint32_t* offsets, const uint16_t* rows) {
             return ClickLanes::parse(window, dim.campaigns, data, offsets, rows,
-                [&](size_t shard, Key person, Key id, Time time, uint32_t campaign) {
-                    w.clicks[shard].push_back({person, {time, id, campaign}});
+                [&](uint64_t hash, Key person, Key id, Time time, uint32_t campaign) {
+                    w.clicks[hash_partition(hash)].push_back({person, {time, id, campaign}});
                 });
         };
         read_rows<4>(chunk, consume, BatchProjection{consume, accelerate});
@@ -174,8 +185,6 @@ struct Pipeline {
     void read(const fs::path& data) {
         CsvFiles ev(data / "events"), ck(data / "clicks"), links(data / "links");
         for (auto& w : workers) {
-            size_t hint = ev.bytes / (74 * workers.size() * partitions);
-            for (auto& v : w.parsed) v.reserve(hint);
             for (auto& v : w.clicks) v.reserve(ck.bytes / (48 * workers.size() * partitions));
         }
         size_t click_start = 1 + ev.chunks.size();
@@ -195,8 +204,10 @@ struct Pipeline {
     }
     void dedup(size_t p, Worker& dst) {
         size_t size = 0;
-        for (auto& w : workers) size += w.parsed[p].size();
-        if (!size) return;
+        for (auto& w : workers)
+            size += w.parsed.size(p);
+        if (!size)
+            return;
         // A hash collision only selects a key for an exact comparison. A lone bit
         // can bypass the full table. Both passes read the same contiguous shard.
         // A pair of adjacent bits in one machine word records seen/repeated:
@@ -204,54 +215,142 @@ struct Pipeline {
         size_t words = std::bit_ceil((size + 1) / 2);
         std::vector<uint64_t> filter(words);
         const size_t slot_mask = words * 32 - 1;
-        for (auto& w : workers) for (const auto& row : w.parsed[p]) {
-            size_t slot = row.id_hash & slot_mask;
+        auto record = [&](uint64_t id) {
+            size_t slot = id & slot_mask;
             uint64_t seen = uint64_t(1) << (2 * (slot & 31));
             auto& word = filter[slot >> 5];
             word |= seen | ((word & seen) << 1);
-        }
+        };
+#if defined(__AVX512CD__)
+        // Three consecutive cache lines hold eight records. Extract the first
+        // word of each record without eight separate memory gathers.
+        auto ids_from = [](const RawEvent* rows) {
+            const char* bytes = reinterpret_cast<const char*>(rows);
+            auto a = _mm512_loadu_si512(bytes), b = _mm512_loadu_si512(bytes + 64),
+                 c = _mm512_loadu_si512(bytes + 128);
+            auto first = _mm512_permutex2var_epi64(a, _mm512_setr_epi64(0, 3, 6, 9, 12, 15, 0, 0), b);
+            return _mm512_mask_permutexvar_epi64(first, 0xc0, _mm512_setr_epi64(0, 0, 0, 0, 0, 0, 2, 5), c);
+        };
+        auto one = _mm512_set1_epi64(1), low = _mm512_set1_epi64(31), mask = _mm512_set1_epi64(slot_mask);
+#endif
+        for (auto& w : workers)
+            w.parsed.visit(p, [&](auto rows) {
+                size_t i = 0;
+#if defined(__AVX512CD__)
+                for (; i + 8 <= rows.size(); i += 8) {
+                    auto slot = ids_from(rows.data() + i) & mask, word = _mm512_srli_epi64(slot, 5);
+                    auto bit = _mm512_sllv_epi64(one, _mm512_slli_epi64(slot & low, 1));
+                    auto old = _mm512_i64gather_epi64(word, filter.data(), 8);
+                    auto next = old | bit | _mm512_slli_epi64(old & bit, 1);
+                    // Only the first lane for a word may scatter. Apply remaining
+                    // updates to that word in order, preserving repeated IDs.
+                    unsigned independent =
+                        _mm512_cmpeq_epi64_mask(_mm512_conflict_epi64(word), _mm512_setzero_si512());
+                    _mm512_mask_i64scatter_epi64(filter.data(), __mmask8(independent), word, next, 8);
+                    for (unsigned left = 255 ^ independent; left; left &= left - 1)
+                        record(rows[i + std::countr_zero(left)].id_hash);
+                }
+#endif
+                for (; i < rows.size(); ++i)
+                    record(rows[i].id_hash);
+            });
         FlatMap<RawEvent*, std::identity{}> best(size / 10);
         auto emit = [&](const RawEvent& row) {
             if (row.person) {
                 dst.events[partition(row.person)].push_back({row.person, row.event});
             }
         };
-        for (auto& w : workers) for (auto& row : w.parsed[p]) {
-            size_t slot = row.id_hash & slot_mask;
-            uint64_t repeated = uint64_t(2) << (2 * (slot & 31));
-            if (!(filter[slot >> 5] & repeated)) {
-                emit(row);
-                continue;
-            }
+        auto repeat = [&](RawEvent& row) {
             auto [prev, fresh] = best.add(row.id_hash, &row);
-            if (!fresh && ingest_order(row.event) < ingest_order(prev->event)) prev = &row;
-        }
-        for (const auto& slot : best.slots()) if (slot.key) emit(*slot.value);
-        for (auto& w : workers) std::vector<RawEvent>().swap(w.parsed[p]);
+            if (!fresh && ingest_order(row.event) < ingest_order(prev->event))
+                prev = &row;
+        };
+        for (auto& w : workers)
+            w.parsed.visit(p, [&](auto rows) {
+                size_t i = 0;
+#if defined(__AVX512CD__)
+                for (; i + 8 <= rows.size(); i += 8) {
+                    auto slot = ids_from(rows.data() + i) & mask;
+                    auto data = _mm512_i64gather_epi64(_mm512_srli_epi64(slot, 5), filter.data(), 8);
+                    auto bits = _mm512_sllv_epi64(_mm512_set1_epi64(2), _mm512_slli_epi64(slot & low, 1));
+                    unsigned hit = _mm512_test_epi64_mask(data, bits);
+                    for (unsigned j = 0; j < 8; ++j) {
+                        auto& row = rows[i + j];
+                        if (hit & (1u << j))
+                            repeat(row);
+                        else
+                            emit(row);
+                    }
+                }
+#endif
+                for (; i < rows.size(); ++i) {
+                    auto& row = rows[i];
+                    size_t slot = row.id_hash & slot_mask;
+                    uint64_t repeated = uint64_t(2) << (2 * (slot & 31));
+                    if (filter[slot >> 5] & repeated)
+                        repeat(row);
+                    else
+                        emit(row);
+                }
+            });
+        for (const auto& slot : best.slots())
+            if (slot.key)
+                emit(*slot.value);
     }
     void group_aliases(size_t p, Worker& dst) {
-        struct Group { Key key; size_t events = 0, clicks = 0; };
-        size_t ne = 0;
-        for (auto& w : workers) ne += w.events[p].size();
-        FlatMap<uint32_t> index(ne / 20);
-        std::vector<Group> groups;
-        for (auto& w : workers) for (auto& e : w.events[p]) {
-            auto [i, fresh] = index.add(e.person, uint32_t(groups.size()));
-            if (fresh) groups.push_back({e.person});
-            ++groups[i].events;
-            e.person = i;
+        using Group = RawGroup;
+        size_t ne = 0, nc = 0;
+        for (auto& w : workers) {
+            ne += w.events[p].size();
+            nc += w.clicks[p].size();
         }
-        for (auto& w : workers) for (auto& c : w.clicks[p]) {
-            auto [i, fresh] = index.add(c.person, uint32_t(groups.size()));
-            if (fresh) groups.push_back({c.person});
-            ++groups[i].clicks;
-            c.person = i;
-        }
+        if (!(ne || nc))
+            return;
+        const size_t capacity = std::bit_ceil(std::max<size_t>((ne + nc) / 9, 8));
+        // Both the primary array and deque preserve group addresses. Once a
+        // row has found its group, its next pass can write directly to it.
+        std::vector<Group> primary(capacity);
+        std::deque<Group> overflow;
+        std::vector<Group*> used;
+        used.reserve(capacity / 2);
+        auto lookup = [&](Key key) {
+            Group* g = &primary[table_hash(key) & (capacity - 1)];
+            if (g->key != key) {
+                if (g->key) {
+                    while (g->next) {
+                        g = g->next;
+                        if (g->key == key)
+                            return g;
+                    }
+                    overflow.emplace_back();
+                    g->next = &overflow.back();
+                    g = g->next;
+                }
+                g->key = key;
+                used.push_back(g);
+            }
+            return g;
+        };
+        for (auto& w : workers)
+            for (auto& e : w.events[p]) {
+                auto* g = lookup(e.person);
+                ++g->events;
+                e.group = g;
+            }
+        for (auto& w : workers)
+            for (auto& c : w.clicks[p]) {
+                auto* g = lookup(c.person);
+                ++g->clicks;
+                c.group = g;
+            }
         size_t en = 0, cn = 0;
-        for (auto& g : groups) {
+        for (auto* entry : used) {
+            auto& g = *entry;
             size_t next_e = en + g.events, next_c = cn + g.clicks;
-            g.events = en; g.clicks = cn;
-            en = next_e; cn = next_c;
+            g.events = en;
+            g.clicks = cn;
+            en = next_e;
+            cn = next_c;
         }
         // Scatter once by raw ID. These arrays stay in place through the canonical
         // shopper pass, so joining aliases moves only range descriptors.
@@ -260,20 +359,26 @@ struct Pipeline {
         ev.resize(en);
         ck.resize(cn);
         for (auto& w : workers) {
-            for (auto& e : w.events[p]) ev[groups[e.person].events++] = unpack(e.value);
-            for (auto& c : w.clicks[p]) ck[groups[c.person].clicks++] = c.value;
+            for (auto& e : w.events[p])
+                ev[e.group->events++] = unpack(e.value);
+            for (auto& c : w.clicks[p])
+                ck[c.group->clicks++] = c.value;
             std::vector<OwnedEvent>().swap(w.events[p]);
             std::vector<OwnedClick>().swap(w.clicks[p]);
         }
         size_t e0 = 0, c0 = 0;
-        for (auto& g : groups) {
+        for (auto* entry : used) {
+            auto& g = *entry;
             // A click-only alias may share a person with an event in another shard.
             Key canonical = people.linked_name(g.key);
             Segment seg{g.events != e0 ? ev.data() + e0 : nullptr, g.clicks != c0 ? ck.data() + c0 : nullptr,
-                        uint32_t(g.events-e0), uint32_t(g.clicks-c0), canonical};
-            if (canonical) dst.segments[partition(canonical)].push_back(seg);
-            else dst.shopper.run(g.key, &seg, dst.days, dst.campaigns);
-            e0 = g.events; c0 = g.clicks;
+                        uint32_t(g.events - e0), uint32_t(g.clicks - c0), canonical};
+            if (canonical)
+                dst.segments[partition(canonical)].push_back(seg);
+            else
+                dst.shopper.run(g.key, &seg, dst.days, dst.campaigns);
+            e0 = g.events;
+            c0 = g.clicks;
         }
     }
     void join_aliases(size_t p, Worker& dst) {

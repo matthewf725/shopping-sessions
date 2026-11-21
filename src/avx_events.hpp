@@ -208,16 +208,16 @@ struct ClickLanes : EventLanes {
         V hash = person ^ _mm512_srli_epi64(person, 32);
         hash = _mm512_mullo_epi64(hash, number(0xd6e8feb86659fd93ULL));
         hash ^= _mm512_srli_epi64(hash, 32);
-        alignas(64) uint64_t names[8], ids[8], times[8], shards[8];
+        alignas(64) uint64_t names[8], ids[8], times[8], hashes[8];
         alignas(32) uint32_t campaigns[8];
         _mm512_store_si512(names, person);
         _mm512_store_si512(ids, click);
         _mm512_store_si512(times, ts);
-        _mm512_store_si512(shards, _mm512_srli_epi64(hash, 56));
+        _mm512_store_si512(hashes, hash);
         _mm256_store_si256(reinterpret_cast<I*>(campaigns), number_id);
         for (unsigned bits = good; bits; bits &= bits - 1) {
             unsigned i = std::countr_zero(bits);
-            store(shards[i], names[i], ids[i], Time(times[i]), campaigns[i]);
+            store(hashes[i], names[i], ids[i], Time(times[i]), campaigns[i]);
         }
         return good;
     }

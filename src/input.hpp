@@ -210,7 +210,57 @@ inline uint64_t quote_parity(uint64_t q) {
 template<class Sink>
 inline size_t scan_csv_tile(const char* data, size_t length, Sink& sink) {
     uint64_t carry = 0, starts_field = 1;
-    for (size_t offset = 0; offset < length; offset += 64) {
+    size_t offset = 0;
+#if defined(__AVX512DQ__) && defined(__AVX512BW__)
+    for (; offset + 512 <= length; offset += 512) {
+        alignas(64) uint64_t edges[10], quotes[8], lines[8];
+        edges[0] = starts_field << 63;
+        for (unsigned j = 0; j < 8; ++j) {
+            auto m = scan64(data + offset + j * 64);
+            edges[j + 1] = m.commas | m.lines;
+            quotes[j] = m.quotes;
+            lines[j] = m.lines;
+        }
+        edges[9] = offset + 512 < length && (data[offset + 512] == ',' || data[offset + 512] == '\n');
+        auto e = _mm512_loadu_si512(edges + 1), q = _mm512_load_si512(quotes);
+        auto previous = _mm512_load_si512(edges), following = _mm512_loadu_si512(edges + 2);
+        auto adjacent = _mm512_slli_epi64(e, 1) | _mm512_srli_epi64(previous, 63) | _mm512_srli_epi64(e, 1) |
+                        _mm512_slli_epi64(following, 63);
+        // Compute quote parity in eight independent words. Prefix XOR of their
+        // high bits supplies the incoming state for every word in the group.
+        auto par = q;
+        par ^= _mm512_slli_epi64(par, 1);
+        par ^= _mm512_slli_epi64(par, 2);
+        par ^= _mm512_slli_epi64(par, 4);
+        par ^= _mm512_slli_epi64(par, 8);
+        par ^= _mm512_slli_epi64(par, 16);
+        par ^= _mm512_slli_epi64(par, 32);
+        unsigned words = _mm512_movepi64_mask(par);
+        words ^= words << 1;
+        words ^= words << 2;
+        words ^= words << 4;
+        unsigned starting = (words << 1) ^ unsigned(carry);
+        par = _mm512_mask_xor_epi64(par, __mmask8(starting), par, _mm512_set1_epi64(-1));
+        auto bad = _mm512_andnot_si512(adjacent, q) | (par & e);
+        unsigned failed = _mm512_test_epi64_mask(bad, bad);
+        if (failed) {
+            unsigned j = std::countr_zero(failed);
+            for (unsigned i = 0; i < j; ++i)
+                sink.append_separators(offset + 64 * i, edges[i + 1], lines[i]);
+            alignas(64) uint64_t errors[8];
+            _mm512_store_si512(errors, bad);
+            uint64_t before = (errors[j] & -errors[j]) - 1;
+            sink.append_separators(offset + 64 * j, edges[j + 1] & before, lines[j] & before);
+            return offset + 64 * j + std::countr_zero(errors[j]);
+        }
+        carry ^= uint64_t(0) - uint64_t((words >> 7) & 1);
+        for (unsigned i = 0; i < 8; ++i)
+            sink.append_separators(offset + 64 * i, edges[i + 1], lines[i]);
+
+        starts_field = edges[8] >> 63;
+    }
+#endif
+    for (; offset < length; offset += 64) {
         size_t left = length - offset;
         Marks m;
         if (left >= 64) m = scan64(data + offset);
