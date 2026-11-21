@@ -255,3 +255,5 @@ On public seed 11971, each fresh Linux Arm container ran as UID 1000 with eight 
 | 4 | Cold | 0.5511 s | 0.5307 s | 0.5872 s |
 
 The Arm build uses the scalar reader. The Xeon-specific decoding experiment on 2M events reduced simulated ticks from 252,305,420 to 237,798,304 for a fixed eight-row reader. Those counters describe guest execution. Builders measures elapsed time on its scoring hardware. [Official scoring procedure](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions)
+
+Three pairs of fresh Linux x86 processes ran the actual 0.87 s release and this release on public seed 719. The launch order alternated between pairs. This release won all three pairs, with 1.461 billion median simulated ticks versus 1.524 billion for the submitted executable. Both builds matched the independent reference on all 2,251,704 shopper-day rows and 28,014 campaign-day rows in every trial. Stage logging was disabled. [Six process measurements and executable hashes](scripts/benchmarks/xeon-seed719-comparison.csv)
