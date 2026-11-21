@@ -227,6 +227,23 @@ def chunk_boundaries(data):
             f.write(f'ebadq{i},u1,{start},{start},view,' + 'x'*i + 'a"b,\n')
             f.write(f'ebadend{i},u1,{start},{start},view,p1,"abc\n')
 
+    # Vary every optional quote and the positions of the first and last commas.
+    # A stray quote in the unused price field still invalidates a view's row.
+    with (data / 'events' / 'columns.csv').open('w') as f:
+        f.write(header)
+        for mask in range(128):
+            for kind in ('view', 'cart', 'purchase'):
+                fields = [f'e{kind[0]}{mask:07d}', 'u12345678', start, start, kind,
+                          'p1' if mask % 3 else '', '0071' if kind == 'purchase' else 'ignored']
+                f.write(','.join(f'"{v}"' if mask & (1 << j) else v for j, v in enumerate(fields)) + '\n')
+        for i, width in enumerate((1, 2, 62, 63, 64, 65, 126, 127, 128, 129, 320, 7001)):
+            f.write(f'e{"a"*width}{i},u{"b"*width},{start},{start},purchase,"p{"x"*width}",91\n')
+            f.write(f'elong-{i},u1,{start},{start},cart,p1,a{"x"*width}"b\n')
+        for i, user in enumerate(('uabc', 'uabc\0', 'uabc\0X', 'uabc\0\0', 'uaé\0xyz', 'uaé\0xyZ')):
+            f.write(f'ekey{i},{user},{start},{start},purchase,p1,{i+1}\n')
+        for i, clock in enumerate(('23:59:59', '24:00:00', '19:60:00', '00:00:60', '02;00:00', '00:0a:00')):
+            f.write(f'eclock{i},u12345678,2025-01-01T{clock}Z,{start},purchase,p1,101\n')
+
 
 def check(exe, data, output):
     subprocess.run([exe, data, output], env=dict(os.environ, NCPU='3'), check=True)

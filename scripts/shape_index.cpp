@@ -80,21 +80,7 @@ struct ShapeIndex {
             else hi = mid;
         }
         auto [before, mask] = words[lo];
-        unsigned in_word = unsigned(ordinal - before);
-#if defined(__BMI2__) && defined(__x86_64__)
-        return lo * 64 + std::countr_zero(_pdep_u64(uint64_t(1) << in_word, mask));
-#else
-        unsigned bit = 0;
-        for (unsigned half = 32; half; half /= 2) {
-            unsigned lower = std::popcount(mask & ((uint64_t(1) << half) - 1));
-            if (in_word >= lower) {
-                bit += half;
-                mask >>= half;
-                in_word -= lower;
-            }
-        }
-        return lo * 64 + bit;
-#endif
+        return lo * 64 + select_bit(mask, unsigned(ordinal - before));
     }
 
     void query(uint64_t first, uint64_t stop, Text mode, uint64_t k) const {

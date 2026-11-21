@@ -74,36 +74,42 @@ struct Pipeline {
         workers.reserve(n);
         for (size_t i = 0; i < n; ++i) workers.emplace_back(uint32_t(i), window, dim, click_keys);
     }
+    void store_event(Worker& w, Key id, Key person, Time ts, int64_t order, uint32_t price, uint32_t category) {
+        uint64_t when = person ? uint64_t(ts - window.start) : 0;
+        PackedEvent event;
+        if (!price && when <= UINT32_MAX && uint64_t(order) < detailed) {
+            event = {uint32_t(when), uint32_t(order)};
+        } else {
+            event = {uint32_t(w.details.size()), detailed | w.number};
+            w.details.push_back({order, {ts, price, category}});
+        }
+        w.parsed[partition(id)].push_back({id, person, event});
+    }
     void parse_events(Chunk chunk, Worker& w) {
-        read_rows<7>(chunk, [&](const auto& f) {
-            Key id = events.encode(f[0]);
-            if (!id) return;
-            // Ingest is guaranteed F1. Retain a tombstone for any invalid earliest copy.
-            if (f[3].size() != 20) return;
-            auto arrival = window.arrival(f[3]);
-            Time ts = window.clock.parse(f[2]);
+        auto consume = [&](Text eid, Text person, Text time, Text ingest, Text kind, bool has_product, auto purchase) {
+            Key id = events.encode(eid);
+            if (!id || ingest.size() != 20) return;
+            auto arrival = window.arrival(ingest);
+            Time ts = window.event_time(time, ingest, arrival.midnight);
             uint32_t price = 0, category = 0;
-            bool valid = !f[1].empty() && !f[5].empty() && ts >= window.start && ts < window.end &&
-                         arrival.on_time(ts, f[3]);
-            if (valid && f[4] == "purchase") {
-                int64_t p = decimal(f[6], 10'000'000);
+            bool valid = !person.empty() && has_product && ts >= window.start && ts < window.end &&
+                         arrival.on_time(ts, ingest);
+            if (valid && kind == "purchase") {
+                auto [product, cents] = purchase();
+                int64_t p = decimal(cents, 10'000'000);
                 valid = p > 0;
                 if (valid) {
                     price = uint32_t(p);
-                    category = dim.products.get(f[5]);
+                    category = dim.products.get(product);
                     if (!category) category = dim.unknown;
                 }
-            } else if (valid) valid = f[4] == "view" || f[4] == "cart";
-            uint64_t when = valid ? uint64_t(ts - window.start) : 0;
-            PackedEvent event;
-            if (!price && when <= UINT32_MAX && uint64_t(arrival.order) < detailed) {
-                event = {uint32_t(when), uint32_t(arrival.order)};
-            } else {
-                event = {uint32_t(w.details.size()), detailed | w.number};
-                w.details.push_back({arrival.order, {ts, price, category}});
-            }
-            w.parsed[partition(id)].push_back({id, valid ? users.encode(f[1]) : 0, event});
-        });
+            } else if (valid) valid = kind == "view" || kind == "cart";
+            // Keep invalid copies by event ID so the earliest ingestion still wins.
+            store_event(w, id, valid ? users.encode(person) : 0, ts, arrival.order, price, category);
+        };
+        read_rows<7>(chunk, [&](const auto& f) {
+            consume(f[0], f[1], f[2], f[3], f[4], !f[5].empty(), [&] { return std::pair{f[5], f[6]}; });
+        }, consume);
     }
     void parse_clicks(Chunk chunk, Worker& w) {
         read_rows<4>(chunk, [&](const auto& f) {

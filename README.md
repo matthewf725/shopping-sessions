@@ -4,7 +4,7 @@ A C++20 pipeline for the [Builders Shopping Sessions track](https://www.joinbuil
 
 ## Algorithm
 
-1. One worker builds the identity graph from the links while the other workers parse CSV chunks. The AVX-512BW build for Cascade Lake scans 64 bytes at a time, checks quote parity at separators and decodes the four date and time pairs in parallel. Event records usually take 24 bytes. Purchases and timestamps outside the compact range have an exact side record.
+1. One worker builds the identity graph from the links while the other workers parse CSV chunks. The reader validates separators and quotes 64 bytes at a time. It locates the fields needed for each event and defers the product value and price until a purchase passes the checks on its other fields. Event records usually take 24 bytes. Purchases and timestamps outside the compact range have an exact side record.
 2. Partition events by exact event ID and retain the earliest ingestion time, including invalid copies. A bitmap sends potential duplicates to an exact hash table. Group the winners and the valid clicks by raw user ID. Each distinct raw ID then needs one identity lookup. A linked shopper's event and click ranges stay in place. The session builder reads them through a list of ranges.
 3. After deduplication and identity linking, each two-hour slot for a shopper starts with one connected interval. An event inside it or within 30 minutes of either endpoint extends that interval. A farther event triggers refinement of just that slot into at most four half-hour cells. The previous interval retains its counts and purchases, and later events can bridge a gap. A bitmap visits the resulting intervals in time order and compares their endpoints across slot boundaries. Very wide windows use four radix passes over occupied half-hour cell numbers.
 4. Session starts are more than 30 minutes apart. A bitmap and prefix counts find the first start eligible for each click. Keep the most recent click at that start, breaking ties by ID, then carry the winner forward until expiration. For assists, group a shopper's clicks by campaign and seven-day bucket. All windows in a bucket overlap, so the earliest eligible session and the latest click determine their exact union. Only adjacent buckets can overlap. Clip each range at the following bucket's first eligible session and count each UTC day's share by subtracting session positions. Identical clicks preserve both endpoints.
@@ -40,6 +40,23 @@ These are medians from nine interleaved warm, fresh-process runs of each build o
 | --- | ---: | ---: | ---: | ---: |
 | 83 | 210.7 ms | 199.3 ms | 422.2 ms | 421.7 ms |
 | 157 | 194.7 ms | 193.0 ms | 410.3 ms | 409.0 ms |
+
+### Field selection on fresh input
+
+The scored reader builds a comma bitmap and prefix counts as it reads each 8 KiB tile. Two nine-byte IDs and their separators fit in the first 24 bytes even when both IDs are quoted. Exactly two commas in those bytes let the reader locate the ID and timestamp fields with two independent bitmap loads. For wider fields it can binary-search the prefix counts to locate a separator. A UTC event timestamp with the same date prefix as its ingestion time reuses the already known midnight.
+
+A view or cart needs a nonempty product. Its first one or two bytes settle that check. Only an otherwise eligible purchase needs the final comma, product value and price. Every physical line still passes the structural check, including quote errors in unused fields. On both generated datasets every syntactically valid event row used the bitmap reader.
+
+| 20M-event seed | Valid CSV event rows | Rows skipping product value and price | Parse and link, before → after | Start to exit, before → after |
+| --- | ---: | ---: | ---: | ---: |
+| 211 | 21,425,622 | 20,794,189 (97.05%) | 185.57 → 165.60 ms | 386.52 → 372.11 ms |
+| 719 | 21,463,092 | 20,830,116 (97.05%) | 189.52 → 168.57 ms | 405.13 → 381.35 ms |
+
+Times are medians of 14 interleaved fresh processes per build and seed after warm-up, using eight M4 Max workers and RAM-backed files with 20M generated events and 5M clicks. Both output tables matched the baseline `d4a5099` on both seeds. The measured change includes an ARM NEON mask reduction. The Xeon build uses AVX-512BW for masks and BMI2 for bit selection.
+
+On seed 719, a separate eight-worker measurement that only validated CSV structure and counted valid lines took a median of 65.42 ms over 14 warm runs. It covered 21,463,092 valid event rows, 5,100,253 click rows and 888,405 link rows. No field values entered that count.
+
+Under Rosetta, an eight-run comparison on seed 719 using x86-64-v2 with PCLMUL took a median of 738.18 ms before and 743.56 ms after, start to exit. Both builds produced identical output. The native Xeon AVX-512 time for this revision is unmeasured.
 
 ### Global structure across shuffled parts
 

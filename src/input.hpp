@@ -13,6 +13,8 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
+#include <utility>
 #include <vector>
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -105,9 +107,27 @@ inline const char* scalar_row(const char* row, const char* end, F& handle) {
     return next;
 }
 
+// Position of the zero-based ordinal set bit. The caller has checked the word's rank.
+inline unsigned select_bit(uint64_t mask, unsigned ordinal) {
+#if defined(__BMI2__) && defined(__x86_64__)
+    return std::countr_zero(_pdep_u64(uint64_t(1) << ordinal, mask));
+#else
+    unsigned bit = 0;
+    for (unsigned half = 32; half; half /= 2) {
+        unsigned lower = std::popcount(mask & ((uint64_t(1) << half) - 1));
+        if (ordinal >= lower) {
+            bit += half;
+            mask >>= half;
+            ordinal -= lower;
+        }
+    }
+    return bit;
+#endif
+}
+
 #if defined(__SSE2__) || defined(__ARM_NEON)
 struct Marks { uint64_t commas, lines, quotes; };
-#if defined(__ARM_NEON)
+#if defined(__ARM_NEON) && !defined(__aarch64__)
 inline uint16_t bits16(uint8x16_t v) {
     // Narrow adjacent comparison bytes, then multiply to gather their top bits.
     uint8x8_t nibbles = vshrn_n_u16(vreinterpretq_u16_u8(v), 4);
@@ -116,6 +136,18 @@ inline uint16_t bits16(uint8x16_t v) {
     x = (x | (x >> 6)) & 0x000f000f000f000fULL;
     x = (x | (x >> 12)) & 0x000000ff000000ffULL;
     return static_cast<uint16_t>(x | (x >> 24));
+}
+#endif
+#if defined(__aarch64__) && defined(__ARM_NEON)
+inline uint64_t neon_mask64(const uint8x16x4_t& blocks, uint8_t c) {
+    // Reduce eight match lanes to one mask byte while the data is still in NEON registers.
+    const uint8x16_t weights = {1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128};
+    auto match = [&](uint8x16_t b) { return vandq_u8(vceqq_u8(b, vdupq_n_u8(c)), weights); };
+    auto ab = vpaddq_u8(match(blocks.val[0]), match(blocks.val[1]));
+    auto cd = vpaddq_u8(match(blocks.val[2]), match(blocks.val[3]));
+    auto four = vpaddq_u8(ab, cd);
+    auto eight = vpadd_u8(vget_low_u8(four), vget_high_u8(four));
+    return vget_lane_u64(vreinterpret_u64_u8(eight), 0);
 }
 #endif
 inline Marks scan64(const char* p) {
@@ -143,6 +175,9 @@ inline Marks scan64(const char* p) {
         m.quotes |= uint64_t(_mm_movemask_epi8(_mm_cmpeq_epi8(v, _mm_set1_epi8('"')))) << i;
     }
     return m;
+#elif defined(__aarch64__) && defined(__ARM_NEON)
+    auto blocks = vld1q_u8_x4(reinterpret_cast<const uint8_t*>(p));
+    return {neon_mask64(blocks, ','), neon_mask64(blocks, '\n'), neon_mask64(blocks, '"')};
 #else
     Marks m{};
     for (unsigned i = 0; i < 64; i += 16) {
@@ -172,22 +207,34 @@ inline uint64_t quote_parity(uint64_t q) {
 // Index a tile with aligned-in-stream, non-overlapping 64-byte scans. Quote
 // parity must be even at every separator, and a quote must touch a field edge.
 // A violation certifies a bad physical line. Retain every fully indexed line before it.
+template<size_t N>
 struct CsvTile {
-    static constexpr size_t target = 8192;
-    static constexpr size_t slack = 192;
-    std::array<uint16_t, target + slack + 1> separator, line_end;
-    size_t fields = 0, lines = 0;
+    static constexpr unsigned target = 8192, slack = 192;
+    static constexpr unsigned words = (target + slack + 63) / 64;
+    static constexpr uint16_t wrong_columns = 0x8000;
+    std::array<uint16_t, target + slack> line_ends;
+    std::array<uint64_t, words + 1> commas{};
+    std::array<uint16_t, words + 1> prefix;
+    unsigned lines, comma_count, previous_count;
+
     void append_separators(size_t offset, uint64_t ends, uint64_t nl) {
-        for (; nl; nl &= nl - 1) {
-            uint64_t first = nl & -nl;
-            line_end[lines++] = uint16_t(fields + std::popcount(ends & (first | (first - 1))));
+        unsigned word = unsigned(offset >> 6);
+        uint64_t mask = ends ^ nl;
+        commas[word] = mask;
+        for (uint64_t bits = nl; bits; bits &= bits - 1) {
+            uint64_t bit = bits & -bits;
+            unsigned count = comma_count + std::popcount(mask & (bit - 1));
+            unsigned end = unsigned(offset) + std::countr_zero(bit);
+            if (count - previous_count != N - 1) end |= wrong_columns;
+            line_ends[lines++] = uint16_t(end);
+            previous_count = count;
         }
-        for (uint64_t bits = ends; bits; bits &= bits - 1)
-            separator[fields++] = uint16_t(offset + std::countr_zero(bits));
+        comma_count += std::popcount(mask);
+        prefix[word + 1] = uint16_t(comma_count);
     }
-    // The caller ends each tile at a newline. Return length on success or the first bad byte.
     size_t index(const char* data, size_t length) {
-        fields = lines = 0;
+        lines = comma_count = previous_count = 0;
+        prefix[0] = 0;
         uint64_t carry = 0, starts_field = 1;
         for (size_t offset = 0; offset < length; offset += 64) {
             size_t left = length - offset;
@@ -216,11 +263,116 @@ struct CsvTile {
         }
         return length;
     }
+    uint64_t commas_from(unsigned pos) const {
+        unsigned w = pos >> 6, shift = pos & 63;
+        return shift ? (commas[w] >> shift) | (commas[w + 1] << (64 - shift)) : commas[w];
+    }
+    unsigned rank(unsigned pos) const {
+        unsigned w = pos >> 6;
+        return prefix[w] + std::popcount(commas[w] & ((uint64_t(1) << (pos & 63)) - 1));
+    }
+    unsigned select(unsigned from, unsigned end, unsigned ordinal) const {
+        unsigned lo = from >> 6, hi = end >> 6;
+        while (lo < hi) {
+            unsigned mid = lo + (hi - lo) / 2;
+            if (prefix[mid + 1] <= ordinal) lo = mid + 1;
+            else hi = mid;
+        }
+        return 64 * lo + select_bit(commas[lo], ordinal - prefix[lo]);
+    }
+    static Text field(const char* first, const char* stop) {
+        unsigned quote = *first == '"';
+        return Text(first + quote, size_t(stop - first) - 2 * quote);
+    }
+    // The row's column count was certified by the structural pass. Short fields
+    // expose the next delimiters in one mask. Wider fields use directory ranks.
+    template<size_t Count>
+    std::array<unsigned, Count> next_commas(unsigned start, unsigned end) const {
+        if constexpr (Count == 0) return {};
+        std::array<unsigned, Count> result;
+        uint64_t mask = commas_from(start);
+        for (auto& pos : result) {
+            pos = start + std::countr_zero(mask);
+            mask &= mask - 1;
+        }
+        if (result.back() == start + 64) {
+            unsigned ordinal = rank(start);
+            for (unsigned i = 0; i < Count; ++i) result[i] = select(start, end, ordinal + i);
+        }
+        return result;
+    }
+    std::array<unsigned, 5> event_stops(unsigned start, unsigned end) const {
+        // Two nine-byte IDs, including optional quotes and both separators, fit
+        // in 24 bytes. This allows both bitmap loads to issue independently.
+        if (end - start >= 24) {
+            uint64_t ids = commas_from(start) & 0xffffff;
+            unsigned after_ids = start + 24;
+            uint64_t body = commas_from(after_ids);
+            unsigned time = after_ids + std::countr_zero(body);
+            body &= body - 1;
+            unsigned ingest = after_ids + std::countr_zero(body);
+            body &= body - 1;
+            unsigned kind = after_ids + std::countr_zero(body);
+            if (std::popcount(ids) == 2 && body) {
+                unsigned id = start + std::countr_zero(ids);
+                unsigned user = start + 63 - std::countl_zero(ids);
+                return {id, user, time, ingest, kind};
+            }
+        }
+        auto [id, user, time] = next_commas<3>(start, end);
+        auto [ingest, kind] = next_commas<2>(time + 1, end);
+        return {id, user, time, ingest, kind};
+    }
+    template<class F, class Project>
+    void visit(const char* data, F& handle, Project& project) const {
+        unsigned start = 0;
+        for (unsigned i = 0; i < lines; ++i) {
+            unsigned marked = line_ends[i], end = marked & ~wrong_columns;
+            if (!(marked & wrong_columns)) {
+                if constexpr (std::is_same_v<Project, std::nullptr_t>) {
+                    auto stops = next_commas<N - 1>(start, end);
+                    std::array<Text, N> fields;
+                    unsigned first = start;
+                    for (size_t j = 0; j < N - 1; ++j) {
+                        fields[j] = field(data + first, data + stops[j]);
+                        first = stops[j] + 1;
+                    }
+                    fields[N - 1] = field(data + first, data + end);
+                    handle(fields);
+                } else {
+                    static_assert(N == 7);
+                    auto [id, user, time, ingest, kind] = event_stops(start, end);
+                    unsigned product = kind + 1;
+                    bool has_product = data[product] != ',' && !(data[product] == '"' && data[product + 1] == '"');
+                    auto purchase = [&] {
+                        unsigned stop = next_commas<1>(product, end)[0];
+                        return std::pair{field(data + product, data + stop), field(data + stop + 1, data + end)};
+                    };
+                    project(field(data + start, data + id), field(data + id + 1, data + user),
+                            field(data + user + 1, data + time), field(data + time + 1, data + ingest),
+                            field(data + ingest + 1, data + kind), has_product, purchase);
+                }
+            }
+            start = end + 1;
+        }
+    }
 };
+
+inline const char* last_complete_line(const char* first, const char* stop) {
+    while (stop - first >= 64) {
+        stop -= 64;
+        uint64_t lines = scan64(stop).lines;
+        if (lines) return stop + 64 - std::countl_zero(lines);
+    }
+    while (stop > first) {
+        if (*--stop == '\n') return stop + 1;
+    }
+    return first;
+}
 #endif
 
-template<size_t N, class F>
-void read_rows(Chunk chunk, F&& handle) {
+template<size_t N, class F, class Project = std::nullptr_t>
+void read_rows(Chunk chunk, F&& handle, Project project = nullptr) {
     // A cut belongs to the preceding chunk through its next newline. Resolve
     // cuts on the parsing threads, so opening the file never faults in every
     // 512 KiB boundary serially. At byte zero this also skips the header.
@@ -233,33 +385,20 @@ void read_rows(Chunk chunk, F&& handle) {
         if (nl) end = nl + 1;
     }
 #if defined(__SSE2__) || defined(__ARM_NEON)
-    CsvTile tile;
-    while (end - row >= 128) {
+    CsvTile<N> tile;
+    while (row < end) {
         const char* stop = end;
-        if (size_t(end - row) > CsvTile::target) {
-            const char* search = row + CsvTile::target;
-            const char* nl = static_cast<const char*>(memchr(search, '\n', std::min<size_t>(end - search, CsvTile::slack)));
-            if (!nl) { row = scalar_row<N>(row, end, handle); continue; }
-            stop = nl + 1;
+        if (size_t(end - row) > CsvTile<N>::target) {
+            const char* search = row + CsvTile<N>::target;
+            const char* nl = static_cast<const char*>(memchr(search, '\n', std::min<size_t>(end - search, CsvTile<N>::slack)));
+            stop = nl ? nl + 1 : last_complete_line(row, search);
+            if (stop == row) { row = scalar_row<N>(row, end, handle); continue; }
+        } else if (stop[-1] != '\n') {
+            stop = last_complete_line(row, stop);
+            if (stop == row) break;
         }
-        if (stop[-1] != '\n') break;
         const char* witness = row + tile.index(row, stop - row);
-        size_t first = 0;
-        unsigned start = 0;
-        for (size_t line = 0; line < tile.lines; ++line) {
-            size_t next = tile.line_end[line];
-            if (next - first == N) {
-                std::array<Text, N> fields;
-                for (size_t k = 0; k < N; ++k) {
-                    unsigned finish = tile.separator[first + k];
-                    unsigned quote = row[start] == '"';
-                    fields[k] = Text(row + start + quote, finish - start - quote * 2);
-                    start = finish + 1;
-                }
-                handle(fields);
-            } else start = tile.separator[next - 1] + 1;
-            first = next;
-        }
+        tile.visit(row, handle, project);
         row = stop;
         if (witness < stop) {
             // Values cannot contain newlines. This tile ends at a newline, so
@@ -273,6 +412,19 @@ void read_rows(Chunk chunk, F&& handle) {
 
 inline int pair_value(const char* p) { return (p[0] - '0') * 10 + (p[1] - '0'); }
 inline bool digits2(const char* p) { return unsigned(p[0] - '0') < 10 && unsigned(p[1] - '0') < 10; }
+inline int clock_seconds(const char* p) {
+    uint64_t word;
+    memcpy(&word, p, 8);
+    if constexpr (std::endian::native == std::endian::big) word = __builtin_bswap64(word);
+    uint64_t digits = word ^ 0x30303a30303a3030ULL;  // "00:00:00" in little-endian order.
+    constexpr uint64_t nibbles = 0x0f0f000f0f000f0fULL;
+    // Adding 15 minus each digit's maximum sets bit 4 precisely on overflow.
+    constexpr uint64_t limits = 0x060a00060a00060dULL, carries = 0x1010001010001010ULL;
+    uint64_t pairs = (digits * 10 + (digits >> 8)) & 0x00ff0000ff0000ffULL;
+    int hour = int(pairs & 255);
+    if ((digits & ~nibbles) || ((digits + limits) & carries) || hour > 23) return -1;
+    return hour * 3600 + int((pairs >> 24) & 255) * 60 + int(pairs >> 48);
+}
 inline int64_t decimal(Text s, int64_t limit) {
     if (s.empty()) return -1;
     int64_t n = 0;
@@ -282,6 +434,14 @@ inline int64_t decimal(Text s, int64_t limit) {
         n = n * 10 + digit;
     }
     return n;
+}
+
+// Input is eight validated ASCII digits in little-endian byte order.
+inline uint32_t eight_digits(uint64_t ascii) {
+    uint64_t digits = ascii - 0x3030303030303030ULL;
+    digits = (digits * 10 + (digits >> 8)) & 0x00ff00ff00ff00ffULL;
+    digits = (digits * 100 + (digits >> 16)) & 0x0000ffff0000ffffULL;
+    return uint32_t(digits) * 10000 + uint32_t(digits >> 32);
 }
 
 // Parse the common 13-digit epoch form without a serial multiply-by-ten chain.
@@ -297,11 +457,7 @@ inline Time epoch13(const char* p) {
     constexpr uint64_t upper = 0x4646464646464646ULL;
     constexpr uint64_t high = 0x8080808080808080ULL;
     if (((head - zero) | (head + upper) | (tail - zero) | (tail + upper)) & high) return invalid_time;
-    head -= zero;
-    head = (head * 10 + (head >> 8)) & 0x00ff00ff00ff00ffULL;
-    head = (head * 100 + (head >> 16)) & 0x0000ffff0000ffffULL;
-    uint32_t first_eight = uint32_t(head) * 10000 + uint32_t(head >> 32);
-    return Time(first_eight) * 100000 + (p[8] - '0') * 10000 + pair_value(p+9) * 100 + pair_value(p+11);
+    return Time(eight_digits(head)) * 100000 + (p[8] - '0') * 10000 + pair_value(p+9) * 100 + pair_value(p+11);
 }
 
 class Clock {
@@ -358,12 +514,12 @@ public:
         }
 #else
         d = pair_value(p+8);
-        int h = pair_value(p+11), min = pair_value(p+14), sec = pair_value(p+17);
-        if constexpr (!trusted) {
-            if (p[10] != 'T' || p[13] != ':' || p[16] != ':' || !digits2(p+8) || !digits2(p+11) ||
-                !digits2(p+14) || !digits2(p+17) || d < 1 || d > m.days || h > 23 || min > 59 || sec > 59) return invalid_time;
+        if constexpr (trusted) {
+            seconds_of_day = (pair_value(p+11) * 60 + pair_value(p+14)) * 60 + pair_value(p+17);
+        } else {
+            seconds_of_day = clock_seconds(p+11);
+            if (p[10] != 'T' || !digits2(p+8) || d < 1 || d > m.days || seconds_of_day < 0) return invalid_time;
         }
-        seconds_of_day = (h * 60 + min) * 60 + sec;
 #endif
         int offset = 0;
         if constexpr (!trusted) {
@@ -403,6 +559,23 @@ struct Window {
         }
     };
 private:
+    struct EpochPrefix { uint64_t text; Time base; };
+    std::array<EpochPrefix, 64> epoch_prefixes_{};
+    static unsigned epoch_slot(const char* p) {
+        return ((unsigned(p[3]) & 3) << 4) | (unsigned(p[4]) & 15);
+    }
+    Time event_epoch13(const char* p) const {
+        uint64_t prefix = 0;
+        memcpy(&prefix, p, 5);
+        const auto& known = epoch_prefixes_[epoch_slot(p)];
+        if (!known.text || known.text != prefix) return epoch13(p);
+        uint64_t digits;
+        memcpy(&digits, p + 5, 8);
+        if constexpr (std::endian::native == std::endian::big) digits = __builtin_bswap64(digits);
+        constexpr uint64_t zero = 0x3030303030303030ULL;
+        if (((digits - zero) | (digits + 0x4646464646464646ULL)) & 0x8080808080808080ULL) return invalid_time;
+        return known.base + eight_digits(digits);
+    }
     struct IngestDay { uint64_t month_prefix; Time midnight; int64_t order_base; };
     std::array<IngestDay, 64> ingest_days_{};
     int32_t first_day_;
@@ -429,6 +602,14 @@ private:
 #endif
     }
 public:
+    Time event_time(Text event, Text ingest, Time midnight) const {
+        if (event.size() == 13) return event_epoch13(event.data());
+        if (event.size() == 20 && memcmp(event.data(), ingest.data(), 11) == 0) {
+            int seconds = clock_seconds(event.data() + 11);
+            return seconds >= 0 && event[19] == 'Z' ? midnight + Time(seconds) * 1000 : invalid_time;
+        }
+        return clock.parse(event);
+    }
     Arrival arrival(Text ingest) const {
         const char* p = ingest.data();
         uint64_t month;
@@ -455,6 +636,17 @@ public:
         end = clock.parse(field("window_end"));
         if (start == invalid_time || end == invalid_time || end <= start) throw std::runtime_error("invalid window");
         using namespace std::chrono;
+        // A 14-day window has at most 14 possible five-digit prefixes for epoch milliseconds.
+        constexpr Time unit = 100'000'000;
+        Time low = std::max<Time>(start, 0) / unit;
+        Time high = std::min<Time>(99'999, (end - 1) / unit);
+        for (Time n = low; n <= std::min(high, low + 31); ++n) {
+            char digits[6];
+            snprintf(digits, sizeof digits, "%05d", int(n));
+            auto& cached = epoch_prefixes_[epoch_slot(digits)];
+            memcpy(&cached.text, digits, 5);
+            cached.base = n * unit;
+        }
         first_day_ = utc_day(start);
         // Cache near-window dates. arrival() checks the month before using a slot.
         int32_t last = std::min(utc_day(end - 1) + 6, first_day_ + 28);
