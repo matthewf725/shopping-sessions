@@ -197,3 +197,16 @@ The native Linux Arm benchmark ran 60M events and 15M clicks from seed 47191 in 
 | Earlier official C++ source, `d744498` | 6 | 1.451 s | 0.992–2.321 s | 7.40 GiB |
 
 For the submitted C++ source, the individual stage medians were 475 ms reading and linking, 148 ms selecting duplicates and partitioning, 331 ms grouping shoppers, building sessions and attributing campaigns, and 19 ms writing Parquet. Each median summarizes six runs. The table uses the median of the six whole-container times. [Per-run measurements](scripts/benchmarks/pinned-rust-comparison.csv)
+
+### Reusing narrower records after deduplication
+
+The tested layout stores each grouped event in eight bytes and each grouped click in 16 bytes. Event times are millisecond offsets from the reporting window. Validated purchases fit in 24 bits for the price and eight bits for the category. The code checks the actual window span and catalog size before choosing the representation. Wider windows and catalogs use the full-width layout. An earlier invalid copy still suppresses a later valid event across users.
+
+| Fresh Linux Arm containers | Submitted C++ source | Narrow event and click records after deduplication | Pinned Rust |
+| --- | ---: | ---: | ---: |
+| 20M events and 5M clicks, 9 runs each | 0.2747 s | 0.2699 s | 0.2830 s |
+| 60M events and 15M clicks, 5 runs each | 0.9300 s | 0.7897 s | 0.9041 s |
+
+Every result matched the independent reference on every column and key. The savings were larger at final size. On the 60M input, median time grouping shoppers, forming sessions and attributing campaigns fell from 314.6 ms to 263.7 ms. [Individual measurements and ELF hashes](scripts/benchmarks/pinned-rust-comparison.csv)
+
+In six interleaved 20M runs of translated Linux x86-64-v2 code, the 0.93 s submission took 0.4410 s median and the 0.87 s submission took 0.4179 s. This comparison uses the same portable instruction set for both versions. A second experiment under host memory pressure reduced duplicate selection from 79.6 ms to 37.4 ms with an index derived from actual event IDs. The whole process increased from 0.8735 s to 0.8846 s versus the same one-pass design with ordinary hashing. All five outputs from each design matched. [Run-level data](scripts/benchmarks/pinned-rust-comparison.csv)
