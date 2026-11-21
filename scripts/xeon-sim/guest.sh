@@ -43,6 +43,7 @@ run() (
         done
         echo "SHOP_SIM_OK $case_name $label $repeat"
     done < /runs
+    if [ -x /bin/memory-control ]; then /bin/memory-control; fi
     tar -cf "$result_disk" -C /result .
     echo SHOP_SIM_COMPLETE
 )

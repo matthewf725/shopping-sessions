@@ -5,6 +5,7 @@ import gzip
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -121,6 +122,8 @@ def simulate(args, work):
             if library.is_file():
                 disk.add(library.resolve(), relative)
         disk.add(assets / "measure", "bin/measure")
+        if args.memory_control:
+            disk.add(args.memory_control, "bin/memory-control")
         for label, binary in programs:
             disk.add(binary, "programs/" + label)
         for case, path in args.data:
@@ -139,6 +142,8 @@ def simulate(args, work):
         "input_disk_sha256": sha256(work / "input.raw"),
         "emulator_sha256": sha256(assets / "bochs"), "kernel_sha256": sha256(assets / "linux"),
     }
+    if args.memory_control:
+        metadata["memory_control_sha256"] = sha256(args.memory_control)
     (args.output / "run.json").write_text(json.dumps(metadata, indent=2) + "\n")
     dest = disk_geometry(work / "result.raw", args.output_mib * 1024**2)
     with (work / "result.raw").open("r+b") as output_disk:
@@ -176,6 +181,12 @@ debug: action=ignore
     expected = [f"SHOP_SIM_OK {case} {label} {n}" for case, label, n in runs]
     if "SHOP_SIM_COMPLETE" not in guest or any(x not in guest.splitlines() for x in expected):
         raise RuntimeError(f"guest did not complete every run, see {logs}")
+    if args.memory_control:
+        samples = re.findall(r"^SHOP_MEMORY_CONTROL bytes=(\d+) loads=1048576 repeat=(\d+) "
+                             r"tsc=\d+ ns=\d+ minflt=\d+ majflt=\d+$", guest, re.MULTILINE)
+        expected_samples = [(size, repeat) for size in (4096, 67108864) for repeat in range(5)]
+        if sorted((int(size), int(repeat)) for size, repeat in samples) != expected_samples:
+            raise RuntimeError(f"incomplete memory control measurements, see {logs / 'guest.log'}")
     counts = re.findall(r"SHOP_SIM_COUNTER instructions=(\d+) virtual_ticks=(\d+)",
                         (logs / "emulator.log").read_text(errors="replace"))
     if len(counts) != len(runs):
@@ -200,6 +211,13 @@ debug: action=ignore
         raise RuntimeError("guest output is missing a Parquet table")
     rows = [dict(dataset=c, binary=b, repeat=i, instructions=int(ins), virtual_ticks=int(ticks))
             for (c, b, i), (ins, ticks) in zip(runs, counts)]
+    tsc = re.findall(r"^SHOP_TSC elapsed=(\d+) cpuid_hz=(\d+)$", guest, re.MULTILINE)
+    if tsc:
+        if len(tsc) != len(rows):
+            raise RuntimeError("missing guest timestamp counter reading")
+        for row, (elapsed, frequency) in zip(rows, tsc):
+            row["guest_tsc_ticks"] = int(elapsed)
+            row["guest_tsc_cpuid_hz"] = int(frequency)
     (logs / "counts.json").write_text(json.dumps(rows, indent=2) + "\n")
     for row in rows:
         print("{dataset} {binary} run {repeat}  {instructions:,} simulated instructions".format(**row))
@@ -215,6 +233,8 @@ def main():
     parser.add_argument("--profile", action="store_true",
                         help="enable pipeline stage timings from the guest's virtual clock")
     parser.add_argument("--memory-mib", type=int, default=1024)
+    parser.add_argument("--memory-control", type=Path, metavar="ELF",
+                        help="run the standalone x86-64 memory timing control after the pipelines")
     parser.add_argument("--resident-mib", type=int,
                         help="host RAM budget for guest pages, up to 8192 MiB in Bochs 3.1")
     parser.add_argument("--output-mib", type=int, default=64)
@@ -222,6 +242,10 @@ def main():
     parser.add_argument("--work-dir", type=Path, help="parent directory for temporary guest disks")
     parser.add_argument("--output", type=Path, required=True, help="new directory for counts and Parquet")
     args = parser.parse_args()
+    if args.memory_control:
+        args.memory_control = args.memory_control.resolve()
+        if not args.memory_control.is_file() or not os.access(args.memory_control, os.X_OK):
+            parser.error(f"--memory-control requires an executable file: {args.memory_control}")
     if min(args.repeat, args.memory_mib, args.output_mib, args.timeout) < 1:
         parser.error("all sizes, repeat and timeout must be positive")
     max_resident = min(args.memory_mib, 8192)

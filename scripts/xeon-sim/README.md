@@ -50,7 +50,45 @@ To expose 24 GiB to Linux, pass `--memory-mib 24576 --resident-mib 6144`. Bochs 
 
 `run.json` identifies the binaries, kernel, emulator and staged input disk by SHA-256 and records the guest configuration. `counts.json` records the instructions executed by all guest CPUs from immediately before fork to immediately after wait, including Linux kernel work inside that interval. `virtual_ticks` records the Bochs scheduler's time units. `guest.log` contains feature checks, exit markers and optional pipeline stage readings from `--profile`. The output directory retains both final Parquet tables per binary and dataset. A failed child, missing marker or missing table makes the command fail.
 
+### Guest timestamp counter
+
+The measurement wrapper fences two `RDTSC` reads around the child process. Each run records the difference in `guest_tsc_ticks`. CPUID leaf 0x15 supplies `guest_tsc_cpuid_hz` when it reports the crystal frequency and ratio. A zero means the guest did not enumerate a rate. Existing prepared wrappers still produce the original counters. Rebuild `measure.c` to capture the new fields. [Intel architecture manuals](https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html)
+
+On the same 2M-event, 500k-click input, two fresh processes per binary gave the following medians. The guest timestamp counter and emulator markers differed by 11–23 ticks per run. Bochs implements the timestamp counter from its scheduler clock. Dividing either reading by a constant therefore preserves the same ratios. [Bochs internal timers](https://bochs.sourceforge.io/doc/docbook/development/timers.html)
+
+| Commit | Guest timestamp ticks, millions | Official 20M-event practice score |
+| --- | ---: | ---: |
+| `ef41f89` | 634.931 | 1.52 s |
+| `1018e64` | 512.313 | 1.12 s |
+| `d744498` | 238.912 | 0.93 s |
+
+Scaling the 1.12 s result by the last two tick counts predicts 0.522 s. The measured 0.93 s is 0.408 s higher. On an actual machine with a synchronized invariant TSC, elapsed seconds equal the difference in timestamp counts divided by the TSC's reference frequency. One interval around launch and exit includes all eight workers.
+
+A second run used a full 20M-event, 5M-click input with seed 719. The three guest timestamp differences were 5,050,095,320, 3,898,724,703 and 1,740,572,136 in the table's commit order. Scaling the first official score predicts 1.173 s for the second. Scaling the second predicts 0.500 s for the third. The official checker matched every row in both tables for all three executions.
+
 The official measurement includes fresh-container startup and exit. Bochs executes instructions functionally and uses an instruction-based clock. Its figures omit native cache and memory stalls, AVX frequency changes and container startup. Changing `ips` changes the guest clock. Only the scorer measures the contest time. [Bochs clock configuration](https://bochs.sourceforge.io/doc/docbook/user/bochsrc.html) · [Builders scoring](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions)
+
+### What the clock measures
+
+The standalone memory control pins one thread to one CPU and follows 1,048,576 dependent pointers. Both working sets run the same load instructions. The program initializes and traverses each ring before measuring it, alternates test order, and reports five measurements per size. Run the same static executable on both systems.
+
+```sh
+docker run --platform linux/amd64 --rm -v "$PWD/scripts/xeon-sim:/src:ro" \
+    -v "$assets:/out" gcc:12-bookworm gcc -O3 -static /src/memory-control.c -o /out/memory-control
+python3 scripts/xeon-sim/run.py --data dev=/path/to/dev-input \
+    --memory-control "$assets/memory-control" --output .bench/memory-check
+# On the comparison Linux system:
+./memory-control
+```
+
+| Working set | Bochs guest timestamp ticks, median | M4 Max running the same Linux ELF through Rosetta, median elapsed |
+| --- | ---: | ---: |
+| 4 KiB | 1,314,323 | 0.875 ms |
+| 64 MiB | 1,319,497 | 107.345 ms |
+
+Increasing the working set changed the simulated count by 0.39% and the measured physical elapsed time by a factor of 123. Both systems reported zero major page faults during every measured traversal. The test isolates a memory cost that a conversion from guest ticks to seconds misses. Measuring this cost on the scoring CPU would require running the control there.
+
+The score image compiles C++ during the Docker build. At runtime, the entrypoint checks CPU features and executes a native Linux ELF. To isolate dynamic linking, both versions of `d744498` used the same two compiled object files. The dynamically linked ELF reproduced the release binary byte for byte. The other linked with `-static`. Two interleaved 20M-event runs per executable gave median guest timestamp counts of 1,728,187,523 for dynamic and 1,716,790,283 for static, a 0.66% difference. Both daily tables matched for both executables. This comparison starts inside a running Linux guest. The organizer's hidden run publishes its overall time and withholds stage timings. [Scored Dockerfile](https://github.com/matthewf725/shopping-sessions/blob/d744498dce64094faae06e2d0b4db9312591965e/Dockerfile) · [Builders scoring](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions)
 
 ## Calibration against scored revisions
 
@@ -85,7 +123,7 @@ With `PROFILE=1` in both binaries, the trial appeared to save 6.2% of total inst
 | First | 30,620,875,815 | 30,576,212,878 | 0.15% |
 | Second | 28,848,477,365 | 28,724,288,620 | 0.43% |
 
-The geometric mean of the two matched ratios gives a 0.29% reduction. Both builds produced the same daily tables. The official submission remains `1018e64`.
+The geometric mean of the two matched ratios gives a 0.29% reduction. Both builds produced the same daily tables. This experiment used the `1018e64` submission as its baseline.
 
 ## Model an individual loop
 

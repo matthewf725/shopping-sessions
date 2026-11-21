@@ -1,12 +1,26 @@
 #include <cpuid.h>
 #include <errno.h>
 #include <grp.h>
+#include <inttypes.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/io.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+static uint64_t read_tsc(void) {
+    unsigned low, high;
+    __asm__ volatile ("lfence; rdtsc; lfence" : "=a"(low), "=d"(high) : : "memory");
+    return ((uint64_t)high << 32) | low;
+}
+
+static uint64_t advertised_tsc_hz(void) {
+    unsigned denominator, numerator, crystal, reserved;
+    if (!__get_cpuid_count(0x15, 0, &denominator, &numerator, &crystal, &reserved) || !denominator)
+        return 0;
+    return (uint64_t)crystal * numerator / denominator;
+}
 
 /* Run inside the Bochs guest. The port is handled by counters.patch. */
 int main(int argc, char **argv) {
@@ -24,7 +38,9 @@ int main(int argc, char **argv) {
         fputs("Cannot use guest ZMM state or simulation counter port\n", stderr);
         return 1;
     }
+    const uint64_t frequency = advertised_tsc_hz();
     outl(0x53484f31, 0xe9);
+    const uint64_t start = read_tsc();
     pid_t child = fork();
     if (child < 0) { perror("fork"); return 1; }
     if (child == 0) {
@@ -38,6 +54,8 @@ int main(int argc, char **argv) {
     while (waitpid(child, &status, 0) < 0) {
         if (errno != EINTR) { perror("waitpid"); return 1; }
     }
+    const uint64_t elapsed = read_tsc() - start;
     outl(0x53484f32, 0xe9);
+    fprintf(stderr, "SHOP_TSC elapsed=%" PRIu64 " cpuid_hz=%" PRIu64 "\n", elapsed, frequency);
     return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
 }
