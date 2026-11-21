@@ -2,6 +2,8 @@
 
 The runner boots an x86-64 Debian Linux guest and executes the same AVX-512 program built by the score image. It works on Apple silicon. It checks eight logical CPUs, the required instruction sets and Linux ZMM state before each run. It captures simulated instruction counts and both output tables. Bochs uses its Skylake-X CPU model. Four cores with two hardware threads each is an assumption about the scorer's eight assigned vCPUs. Google offers Cascade Lake and Ice Lake platforms for N2. [Bochs CPU models](https://bochs.sourceforge.io/doc/docbook/user/cpu-models.html) · [Google N2 platforms](https://docs.cloud.google.com/compute/docs/general-purpose-machines#n2_series)
 
+The build applies a decoder correction to Bochs 3.1 so AVX-512 gathers can use vector index registers 16 through 31. GCC uses this encoding in the eight-event parser. [Intel instruction-set reference](https://cdrdv2-public.intel.com/835757/325383-sdm-vol-2abcd.pdf)
+
 ## Prepare from a fresh checkout
 
 Use Python 3.11 or newer, a C/C++ compiler for the host, Make, patch, tar, bsdtar and ar. Docker can provide the score-image libraries, Linux executable and static guest helper. Run these commands at the repository root.

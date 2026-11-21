@@ -1,0 +1,17 @@
+--- a/cpu/decoder/fetchdecode32.cc
++++ b/cpu/decoder/fetchdecode32.cc
+@@ -1332,10 +1332,13 @@
+     case BX_SRC_VSIB:
+       if (! i->as32L())
+         return BX_VSIB_FORBIDDEN_ASIZE16;
+-      if (i->sibIndex() == BX_NIL_REGISTER)
++      if ((rm & 7) != 4)
+         return BX_VSIB_ILLEGAL_SIB_INDEX;
+ #if BX_SUPPORT_EVEX
+       i->setSibIndex(i->sibIndex() | (vvv & 0x10));
++      // EVEX.V-prime extends the VSIB index. Only the low four vvvv bits
++      // describe the reserved register operand on a masked gather/scatter.
++      if (had_evex) vvv &= 0xf;
+       // zero masking is not allowed for gather/scatter
+       if (i->isZeroMasking()) return BX_EVEX_ILLEGAL_ZERO_MASKING_VSIB;
+       mem_src = true;

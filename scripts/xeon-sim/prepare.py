@@ -79,8 +79,9 @@ def prepare(args, work):
     bochs.mkdir()
     subprocess.run(["tar", "-xzf", archive, "-C", bochs, "--strip-components=2",
                     "Bochs-REL_3_1_FINAL/bochs"], check=True)
-    with (HERE / "counters.patch").open("rb") as patch:
-        subprocess.run(["patch", "-p1"], cwd=bochs, stdin=patch, check=True)
+    for name in ("counters.patch", "vsib.patch"):
+        with (HERE / name).open("rb") as patch:
+            subprocess.run(["patch", "-p1"], cwd=bochs, stdin=patch, check=True)
     subprocess.run(["./configure", "--enable-x86-64", "--enable-smp", "--enable-avx",
                     "--enable-evex", "--with-nogui", "--without-x11", "--without-sdl2",
                     "--disable-plugins"], cwd=bochs, check=True,
