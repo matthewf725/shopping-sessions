@@ -7,23 +7,26 @@
 namespace shop {
 namespace {
 class Bytes {
-    std::unique_ptr<uint8_t[]> memory_;
+    std::unique_ptr<uint8_t[]> owned_;
+    uint8_t* memory_ = nullptr;
     size_t size_ = 0, capacity_ = 0;
     [[gnu::noinline]] void grow(size_t need) {
         size_t cap = std::max(need, std::max<size_t>(64, capacity_ + capacity_ / 2));
         auto next = std::make_unique_for_overwrite<uint8_t[]>(cap);
         if (size_)
-            memcpy(next.get(), memory_.get(), size_);
-        memory_ = std::move(next);
+            memcpy(next.get(), memory_, size_);
+        memory_ = next.get();
+        owned_ = std::move(next);
         capacity_ = cap;
     }
 
 public:
+    explicit Bytes(std::span<uint8_t> spare = {}) : memory_(spare.data()), capacity_(spare.size()) {}
     size_t size() const {
         return size_;
     }
     uint8_t* data() const {
-        return memory_.get();
+        return memory_;
     }
     void reset(size_t capacity = 0) {
         size_ = 0;
@@ -35,7 +38,7 @@ public:
             throw std::length_error("Parquet buffer is too large");
         if (size_ + n > capacity_)
             grow(size_ + n);
-        auto* dest = memory_.get() + size_;
+        auto* dest = memory_ + size_;
         size_ += n;
         return dest;
     }
@@ -170,8 +173,8 @@ class File {
 
 public:
     Bytes page;
-    File(const fs::path& name, std::span<const Column> schema)
-        : stream_(fopen(name.c_str(), "wb")), schema_(schema) {
+    File(const fs::path& name, std::span<const Column> schema, std::span<uint8_t> spare = {})
+        : stream_(fopen(name.c_str(), "wb")), schema_(schema), page(spare) {
         if (!stream_)
             throw std::system_error(errno, std::generic_category(), "open " + name.string());
         write("PAR1", 4);
@@ -256,16 +259,18 @@ size_t rows_per_group(size_t longest_string) {
 }
 } // namespace
 
-void write_users(const fs::path& path, const std::vector<UserDay>& rows, const Keys& users,
-                 const Dimensions& dimensions) {
-    File f(path, user_schema);
+void write_users(const fs::path& path, const UserDays& rows, const Keys& users,
+                 const Dimensions& dimensions, std::span<uint8_t> spare) {
+    File f(path, user_schema, spare);
     size_t width = users.longest();
     for (const auto& category : dimensions.categories)
         width = std::max(width, category.size());
     const size_t group_rows = rows_per_group(width);
-    for (size_t base = 0; base < rows.size(); base += group_rows) {
-        auto* row = rows.data() + base;
-        size_t n = std::min(group_rows, rows.size() - base);
+    for (size_t base = 0; base < rows.size();) {
+        auto group = rows.range(base, group_rows);
+        const auto* row = group.data();
+        size_t n = group.size();
+        base += n;
         f.group(n);
         auto& data = f.page;
         data.reset(n * 13);

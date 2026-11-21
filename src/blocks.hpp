@@ -149,6 +149,11 @@ public:
         }
     }
 #endif
+    // Called after all visits to these fixed-size record blocks have finished.
+    std::span<uint8_t> writer_page() {
+        if (pages_.empty()) return {};
+        return {static_cast<uint8_t*>(pages_.front().get()), page_bytes};
+    }
     size_t size(size_t shard) const {
         const auto &c = shards_[shard];
         const auto &chain = chains_[shard];

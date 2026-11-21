@@ -1,5 +1,6 @@
 #pragma once
 #include "keys.hpp"
+#include <span>
 
 namespace shop {
 constexpr Time gap = 30 * 60 * 1000;
@@ -14,6 +15,35 @@ struct Segment {
     Segment* next = nullptr;
 };
 struct UserDay { Key person; int32_t day, sessions, events; uint32_t top; int64_t revenue; };
+// A block is one ordinary Parquet row group. Rows remain contiguous within a block.
+class UserDays {
+    static constexpr size_t block_rows = 65536;
+    std::vector<UserDay*> blocks_;
+    size_t count_ = 0;
+    void* arena_ = nullptr;
+    UserDay* (*allocate_)(void*) = nullptr;
+public:
+    template<class Pool> void use(Pool& pool) {
+        arena_ = &pool;
+        allocate_ = [](void* state) {
+            return static_cast<Pool*>(state)->template allocate_range<UserDay>(block_rows);
+        };
+    }
+    void push_back(const UserDay& row) {
+        size_t index = count_ % block_rows;
+        if (index == 0) blocks_.push_back(allocate_(arena_));
+        blocks_.back()[index] = row;
+        ++count_;
+    }
+    UserDay& back() { return blocks_.back()[(count_ - 1) % block_rows]; }
+    size_t size() const { return count_; }
+    bool empty() const { return count_ == 0; }
+    std::span<const UserDay> range(size_t first, size_t limit) const {
+        size_t offset = first % block_rows;
+        return {blocks_[first / block_rows] + offset,
+                std::min({block_rows - offset, count_ - first, limit})};
+    }
+};
 struct Credits { int64_t sessions{}, purchasing{}, revenue{}; };
 struct Totals : Credits { int64_t assists{}; };
 struct SessionDay { int32_t day; uint32_t stop; }; // Exclusive session rank for this UTC day.
@@ -203,7 +233,7 @@ class Shopper {
             }
         }
     }
-    void form_sessions(Key person, std::vector<UserDay>& users) {
+    template<class Rows> void form_sessions(Key person, Rows& users) {
         session_days_.clear();
         Time last = invalid_time;
         auto take = [&](const Bucket& b) {
@@ -333,7 +363,7 @@ public:
             start_rank_.resize(occupied_.size());
         }
     }
-    void run(Key person, const Segment* chain, std::vector<UserDay>& users, CampaignDays& campaigns) {
+    template<class Rows> void run(Key person, const Segment* chain, Rows& users, CampaignDays& campaigns) {
         sessions_.clear();
         first_word_ = occupied_.size();
         last_word_ = 0;

@@ -10,7 +10,7 @@
 #include <thread>
 
 namespace shop {
-constexpr unsigned partition_bits = 6;
+constexpr unsigned partition_bits = 8;
 constexpr size_t partitions = size_t{1} << partition_bits;
 inline size_t hash_partition(uint64_t hash) { return hash >> (64 - partition_bits); }
 inline size_t partition(Key key) { return hash_partition(hash_key(key)); }
@@ -39,7 +39,7 @@ struct Worker {
     std::array<std::vector<Segment>, partitions> segments;
     ShardedBlocks<OwnedEvent, partitions> events;
     ShardedBlocks<OwnedClick, partitions> clicks;
-    std::vector<UserDay> days;
+    UserDays days;
     CampaignDays campaigns;
     Shopper shopper;
     Worker(uint32_t index, const Window& w, const Dimensions& d, const Keys& click_keys)
@@ -215,7 +215,6 @@ struct Pipeline {
 #endif
         };
         for (auto &w : workers) {
-            preallocate(w.days, per_worker / 600);
             preallocate(w.details, per_worker / 1600);
         }
         size_t click_start = 1 + ev.chunks.size();
@@ -492,8 +491,10 @@ struct Pipeline {
     void run(const fs::path& data, const fs::path& output, Profile& profile) {
         read(data); profile.mark("parse and link");
         parallel(workers.size(), partitions, [&](size_t wi, size_t p) { dedup(p, workers[wi]); });
-        for (auto& w : workers)
+        for (auto& w : workers) {
             w.parsed.recycle_pages();
+            w.days.use(w.parsed);
+        }
         profile.mark("deduplicate and partition");
         parallel(workers.size(), partitions, [&](size_t wi, size_t p) { group_aliases(p, workers[wi]); });
         parallel(workers.size(), partitions, [&](size_t wi, size_t p) { join_aliases(p, workers[wi]); });
@@ -503,7 +504,7 @@ struct Pipeline {
         parallel(workers.size(), workers.size() + 1, [&](size_t, size_t part) {
             if (part < workers.size()) {
                 if (part == 0 || !workers[part].days.empty())
-                    write_users(output / "user_daily" / ("part-" + std::to_string(part) + ".parquet"), workers[part].days, users, dim);
+                    write_users(output / "user_daily" / ("part-" + std::to_string(part) + ".parquet"), workers[part].days, users, dim, workers[part].events.writer_page());
             } else {
                 CampaignDays total(window, dim.names.size());
                 for (auto& w : workers) w.campaigns.each([&](uint32_t c, int32_t day, const Totals& from) {
